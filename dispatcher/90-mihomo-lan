@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# NetworkManager dispatcher: start/stop mihomo when campus LAN connects/disconnects.
+# Installed by mnnit-proxy install.sh  -  do not edit manually.
+# $1 = interface, $2 = action
+
+IFACE="$1"; ACTION="$2"
+[ "$IFACE" = "lo" ] && exit 0
+log() { logger -t mihomo-lan "$*"; }
+
+# Check if any interface currently has a campus (172.31.*) default gateway
+campus_link() {
+  for d in /sys/class/net/*/; do
+    i=$(basename "$d")
+    [ "$i" = "lo" ] && continue
+    gw=$(ip route show default dev "$i" 2>/dev/null | awk '{print $3}')
+    [[ "$gw" == 172.31.* ]] && return 0
+  done
+  return 1
+}
+
+case "$ACTION" in
+  up)
+    if campus_link; then
+      GW=$(ip route show default dev "$IFACE" 2>/dev/null | awk '{print $3}')
+      log "campus gateway $GW detected on $IFACE -> starting mihomo"
+      systemctl start mihomo || log "start failed"
+    else
+      log "$IFACE up but not on campus network -> stopping mihomo"
+      systemctl stop mihomo 2>/dev/null || true
+    fi
+    ;;
+  down|pre-down)
+    if campus_link; then
+      log "$IFACE down but another campus link still active -> keeping mihomo"
+    else
+      if systemctl is-active --quiet mihomo 2>/dev/null; then
+        log "no campus link left -> stopping mihomo"
+        systemctl stop mihomo
+      fi
+    fi
+    ;;
+esac
+exit 0

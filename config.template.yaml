@@ -1,0 +1,37 @@
+mixed-port: 7890
+mode: rule
+log-level: info
+ipv6: false
+
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack: [any:53]
+  route-exclude-address:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  nameserver: [172.31.100.6, 172.31.100.7, 172.31.100.8]
+  default-nameserver: [172.31.100.6, 172.31.100.7]
+
+proxies:
+{{PROXY_ENTRIES}}
+
+proxy-groups:
+  - name: PROXY
+    type: fallback
+    proxies: [{{PROXY_NAMES}}]
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+
+rules:
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - MATCH,PROXY

@@ -1,0 +1,35 @@
+# mnnit-proxy hostel data
+# columns: name | group | ip_from | ip_to | gateway | prefix_len | proxies (comma-sep) | pdf_url
+# gateway may be "floorwise" = derive /24 gateway from the chosen IP (.1 of its /24)
+# prefix_len may be "floorwise" meaning per-floor /24 (gateway computed from IP)
+# Proxies share port 3128 and the edcguest/edcguest credentials.
+#
+# Groups: Boys | Girls | Staff-Residential
+
+# ---------- Boys Hostels ----------
+Swami Vivekananda Boys Hostel|Boys|172.31.136.3|172.31.143.254|floorwise|floorwise|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/images/newstories/2022/ipaddress/SVBH_IP_ADDRESS_RANGE.pdf
+Post Graduate Hostel|Boys|172.31.144.3|172.31.147.254|172.31.144.1|22|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/computercentre/images/ipadd/PG%20Hostel.pdf
+Patel Hostel|Boys|172.31.72.3|172.31.75.254|172.31.72.1|22|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/images/newstories/2026/fac_pos/Patel_Hostel_Room_Wise_IP_Allotment.pdf
+Tilak Hostel|Boys|172.31.76.3|172.31.79.254|172.31.76.1|22|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/images/newstories/2026/fac_pos/Tilak_Hostel_Room_Wise_IP_Allotment.pdf
+Malviya Hostel|Boys|172.31.80.3|172.31.83.254|172.31.80.1|22|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/images/newstories/2026/fac_pos/Malviya_Hostel_new_IP_Allotment_room_wise.pdf
+Tandon Hostel|Boys|172.31.84.3|172.31.87.254|172.31.84.1|22|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/images/newstories/2026/fac_pos/Tandon_Hostel_new_IP_Allotment_room_wise.pdf
+Tagore Hostel|Boys|172.31.88.3|172.31.91.254|172.31.88.1|22|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/images/newstories/2022/ipaddress/tagore.pdf
+Raman Hostel|Boys|172.31.92.3|172.31.95.254|172.31.92.1|22|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/images/newstories/2022/ipaddress/Raman.pdf
+New Boys Hostel A Block|Boys|172.31.64.60|172.31.65.168|172.31.64.1|23|172.31.100.27,172.31.102.29|https://mnnit.ac.in/images/newstories/2022/ipaddress/IP_List_of_A_Block_Hostel.pdf
+New Boys Hostel B Block|Boys|172.31.66.60|172.31.67.130|172.31.66.1|23|172.31.100.27,172.31.102.29|https://mnnit.ac.in/images/newstories/2022/ipaddress/IP_List_of_B_Block_Hostel.pdf
+New Boys Hostel C Block|Boys|172.31.68.60|172.31.69.168|172.31.68.1|23|172.31.100.27,172.31.102.29|https://mnnit.ac.in/images/newstories/2022/ipaddress/IP_LIST_of_C_Block_Hostel.pdf
+
+# ---------- Girls Hostels ----------
+Kamla Nehru Girls Hostel|Girls|172.31.159.3|172.31.159.254|172.31.159.1|22|172.31.100.25,172.31.100.27,172.31.100.30|https://mnnit.ac.in/images/newstories/2022/ipaddress/KNGH.pdf
+Sarojni Naidu Girls Hostel|Girls|172.31.159.3|172.31.159.254|172.31.159.1|24|172.31.100.25,172.31.100.27,172.31.100.30|https://mnnit.ac.in/images/newstories/2018/SNGH_IP_Allotment.pdf
+Diamond Jubilee Girls Hostel|Girls|172.31.160.51|172.31.161.200|172.31.160.1|23|172.31.100.25,172.31.100.27,172.31.100.30|https://mnnit.ac.in/images/newstories/2022/ipaddress/DJ_GIRLS_HOSTEL.pdf
+International Hostel A|Girls|172.31.152.3|172.31.152.254|172.31.152.1|24|172.31.100.25,172.31.100.27,172.31.100.30|https://mnnit.ac.in/computercentre/images/ipadd/BF%20&%20IH.pdf
+International Hostel B|Girls|172.31.153.3|172.31.153.254|172.31.153.1|24|172.31.100.25,172.31.100.27,172.31.100.30|https://mnnit.ac.in/computercentre/images/ipadd/BF%20&%20IH.pdf
+
+# ---------- Staff / Residential ----------
+Staff Colony & Quarters|Staff-Residential|172.31.153.201|172.31.156.254|172.31.154.1|24|172.31.100.14,172.31.100.25,172.31.100.26,172.31.100.27,172.31.100.30,172.31.102.14|https://mnnit.ac.in/computercentre/images/ipadd/Colony.pdf
+Faculty Quarters (A-D & G/W Blocks)|Staff-Residential|172.31.154.11|172.31.156.175|172.31.154.1|24|172.31.100.14,172.31.100.25,172.31.100.26,172.31.100.27,172.31.100.30,172.31.102.14|https://mnnit.ac.in/computercentre/images/ipadd/MNNIT-%20IP%20addressing%20schemecblock.pdf
+EDC / Guest House / Dispensary|Staff-Residential|172.31.156.133|172.31.156.254|172.31.156.129|26|172.31.100.14,172.31.100.25,172.31.100.26,172.31.100.27,172.31.100.30,172.31.102.14|https://mnnit.ac.in/computercentre/images/ipadd/EDC.pdf
+
+# ---------- Manual / unknown ----------
+I don't know / not listed|Boys|172.31.0.0|172.31.255.255|172.31.64.1|23|172.31.100.25,172.31.100.27,172.31.100.29,172.31.100.30,172.31.102.29|https://mnnit.ac.in/computercentre/index.php/ip-address-scheme

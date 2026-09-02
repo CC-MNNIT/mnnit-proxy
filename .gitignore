@@ -1,0 +1,10 @@
+# Editor
+*~
+*.swp
+.DS_Store
+
+# Logs
+*.log
+
+# Local overrides
+*.local
