@@ -1,0 +1,17 @@
+# Ubuntu test image with systemd enabled - used by tests/docker-ubuntu.sh
+# Simulates a real Ubuntu desktop for integration testing mnnit-proxy.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y -qq \
+      systemd systemd-sysv sudo curl ca-certificates iproute2 \
+      python3 gzip tinyproxy && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Allow sudo without password (integration test runs as root anyway)
+RUN userdel -r ubuntu 2>/dev/null || true
+
+# systemd as PID 1
+STOPSIGNAL SIGRTMIN+3
+CMD ["/lib/systemd/systemd"]

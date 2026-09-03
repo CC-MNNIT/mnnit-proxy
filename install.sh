@@ -1,24 +1,40 @@
 #!/usr/bin/env bash
 # mnnit-proxy installer  -  system-wide college proxy for MNNIT Allahabad
-# Usage:  curl -fsSL https://raw.github.com/.../install.sh | sudo bash
-#         sudo bash install.sh [--hostel NAME] [--ip IP] [--no-lan-watch]
-#         sudo bash install.sh --uninstall
-#         sudo bash install.sh --diagnose
+#
+# Usage:
+#   sudo bash install.sh                                    # interactive
+#   sudo bash install.sh --hostel "New Boys Hostel A Block" \
+#                        --ip 172.31.64.135 --yes           # unattended
+#   sudo bash install.sh --uninstall
+#   sudo bash install.sh --diagnose
+#
+# Flags:
+#   --hostel NAME      hostel name (exact or unique substring)
+#   --ip IP            your assigned IP from the hostel PDF
+#   --gateway IP       override the derived gateway (e.g. SVBH floor-wise)
+#   --yes              accept all prompts (unattended; needs --hostel + --ip)
+#   --force            proceed even if IP is outside the documented range
+#   --skip-ip          don't touch nmcli/network settings
+#   --no-tun           proxy port only, no TUN device (CI/VM friendly)
+#   --no-lan-watch     don't install the LAN auto start/stop watcher
+#   --uninstall        remove everything
+#   --diagnose         run diagnostics
 set -Eeuo pipefail
 
-readonly VERSION="1.0.0"
+readonly APP_VERSION="1.1.0"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
-readonly DNS_SRV="172.31.100.6 172.31.100.7 172.31.100.8"
+readonly DNS_SRV="172.31.100.6, 172.31.100.7, 172.31.100.8"
 readonly DNS_SRV_LIST="172.31.100.6,172.31.100.7,172.31.100.8"
-readonly DEFAULT_PROXY_LIST="172.31.100.25,172.31.100.27,172.31.100.30"
+readonly MIHOMO_PINNED="v1.19.30"   # fallback when GitHub API is unavailable
 
-# Data files  -  local dir first, then fallback to downloaded
+# Data files  -  local dir first, then fallback to downloaded (pipe mode)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || pwd)"
 TSV="$SCRIPT_DIR/hostels.tsv"
 TEMPLATE="$SCRIPT_DIR/config.template.yaml"
 DISPATCHER="$SCRIPT_DIR/dispatcher/90-mihomo-lan"
+
 WIRED_IFACE=""
 WIRED_CONN=""
 SELECTED_HOSTEL_NAME=""
@@ -26,13 +42,23 @@ SELECTED_HOSTEL_IP=""
 SELECTED_HOSTEL_GW=""
 SELECTED_HOSTEL_PREFIX=""
 SELECTED_HOSTEL_PROXIES=""
-PROXY_NAMES=""
+TMPDIR_DATA=""
+
+# ---- flags ----
+FLAG_HOSTEL=""
+FLAG_IP=""
+FLAG_GATEWAY=""
+FLAG_FORCE=false
+FLAG_YES=false
+FLAG_SKIP_IP=false
+FLAG_NO_TUN=false
+FLAG_NO_LAN_WATCH=false
 
 # ---- colors ----
 if [[ -t 1 ]]; then
   R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; B=$'\e[1m'; N=$'\e[0m'
 else
-  R=; G=; Y=; C=; B=; N=
+  R=""; G=""; Y=""; C=""; B=""; N=""
 fi
 
 log()  { echo -e "${B}${C}[*]${N} $*"; }
@@ -42,32 +68,30 @@ fail() { echo -e " ${R}${B}✗${N} $*"; }
 die()  { fail "$*"; exit 1; }
 
 # ---- signal handling ----
-cleanup() {
-  [[ -n "${TMPDIR_DATA:-}" ]] && rm -rf "$TMPDIR_DATA" 2>/dev/null
-}
+cleanup() { [[ -n "$TMPDIR_DATA" ]] && rm -rf "$TMPDIR_DATA" 2>/dev/null || true; }
 trap cleanup EXIT
 
-# ---- prompt helpers (pipe-safe: read from /dev/tty) ----
+# ---- prompt helpers (pipe-safe: read from /dev/tty when available) ----
 __tty_read() {
-  if [[ -t 0 ]]; then read -r "$@"
-  else read -r "$@" < /dev/tty
-  fi
+  if [[ -t 0 ]]; then read -r "$@"; return 0; fi
+  if [[ -r /dev/tty ]]; then read -r "$@" < /dev/tty; return 0; fi
+  return 1   # no interactive input available (CI/non-tty)
 }
 
 ask() {
-  local prompt="$1" default="${2:-}" reply
+  local prompt="$1" default="${2:-}" reply=""
   echo -en "${B}${prompt}${N} " >&2
-  __tty_read reply
-  [[ -z "$reply" && -n "$default" ]] && reply="$default"
+  __tty_read reply || reply=""
+  if [[ -z "$reply" && -n "$default" ]]; then reply="$default"; fi
   echo "$reply"
 }
 
 confirm() {
-  local prompt="$1" default="${2:-y}" reply
+  local prompt="$1" default="${2:-y}" reply=""
   local dfl="${default^^}"
   echo -en "${B}${prompt}${N} [${dfl}] " >&2
-  __tty_read reply
-  reply="${reply:-$default}"
+  __tty_read reply || reply=""
+  if [[ -z "$reply" ]]; then reply="$default"; fi
   [[ "${reply,,}" == "y" || "${reply,,}" == "yes" ]]
 }
 
@@ -78,48 +102,34 @@ ip2int() {
   echo "$((a<<24 | b<<16 | c<<8 | d))"
 }
 
-int2ip() {
-  local n=$1
-  echo "$((n>>24 & 255)).$((n>>16 & 255)).$((n>>8 & 255)).$((n & 255))"
-}
-
 in_range() {
-  local ip="$1" from="$2" to="$3"
   local ip_i from_i to_i
-  ip_i=$(ip2int "$ip")
-  from_i=$(ip2int "$from")
-  to_i=$(ip2int "$to")
+  ip_i=$(ip2int "$1")
+  from_i=$(ip2int "$2")
+  to_i=$(ip2int "$3")
   ((ip_i >= from_i && ip_i <= to_i))
 }
 
+valid_ip() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
 # ---- download with mirror chain ----
-DLOAD_MIRRORS=(
-  ""
-  "https://ghfast.top/"
-  "https://gh-proxy.com/"
-  "https://mirror.ghproxy.com/"
-)
+DLOAD_MIRRORS=("" "https://ghfast.top/" "https://gh-proxy.com/" "https://mirror.ghproxy.com/")
 
 download() {
-  local url="$1" out="$2" extra="${3:-}"
-  local mirror src
+  local url="$1" out="$2" mirror src
   for mirror in "${DLOAD_MIRRORS[@]}"; do
     src="${mirror}${url}"
-    if curl -fsSL --max-time 15 ${extra:+-x "$extra"} "$src" -o "$out" 2>/dev/null; then
+    if curl -fsSL --max-time 15 "$src" -o "$out" 2>/dev/null; then
       return 0
     fi
   done
   return 1
 }
 
-# ---- bootstrap internet (try direct, then college proxy) ----
+# ---- bootstrap internet (try direct, then campus proxy) ----
 boot_internet() {
   log "Checking internet connectivity..."
-  if curl -fsSL --max-time 5 -o /dev/null https://github.com 2>/dev/null; then
-    ok "Internet working"
-    return 0
-  fi
-  # Try a few endpoints
+  local ep
   for ep in "https://github.com" "https://www.google.com" "https://1.1.1.1"; do
     if curl -fsSL --max-time 5 -o /dev/null "$ep" 2>/dev/null; then
       ok "Internet working"
@@ -140,45 +150,44 @@ boot_internet() {
   die "No internet  -  check your connection or run on campus."
 }
 
-# ---- fetch data files if running from pipe ----
+# ---- fetch data files if running from a pipe ----
 ensure_data() {
   if [[ -f "$TSV" && -f "$TEMPLATE" ]]; then
     return 0
   fi
   local base="${REPO_RAW:-https://raw.githubusercontent.com/YOUR_USER/mnnit-proxy/main}"
   TMPDIR_DATA="$(mktemp -d)"
-  log "Downloading data files from repo..."
+  log "Running from a pipe  -  downloading data files..."
   download "$base/hostels.tsv" "$TMPDIR_DATA/hostels.tsv" \
-    || die "Failed to download hostel data (check repo URL)"
+    || die "Failed to download hostel data (check REPO_RAW URL)"
   download "$base/config.template.yaml" "$TMPDIR_DATA/config.template.yaml" \
     || die "Failed to download config template"
-  download "$base/dispatcher/90-mihomo-lan" "$TMPDIR_DATA/dispatcher" \
-    || warn "Could not download dispatcher  -  will skip LAN watch"
+  download "$base/dispatcher/90-mihomo-lan" "$TMPDIR_DATA/90-mihomo-lan" \
+    || warn "Could not download dispatcher  -  LAN watch will be skipped"
   TSV="$TMPDIR_DATA/hostels.tsv"
   TEMPLATE="$TMPDIR_DATA/config.template.yaml"
-  DISPATCHER="$TMPDIR_DATA/dispatcher"
+  DISPATCHER="$TMPDIR_DATA/90-mihomo-lan"
   chmod 755 "$DISPATCHER" 2>/dev/null || true
 }
 
-# ---- detect distro ----
+# ---- distro ----
 DISTRO=""
 DISTRO_FAMILY=""
 detect_distro() {
-  if [[ -f /etc/os-release ]]; then
-    local id
-    id=$(grep ^ID= /etc/os-release | cut -d= -f2 | tr -d '"')
-    case "$id" in
-      arch|manjaro|endeavouros|archarm) DISTRO="arch"; DISTRO_FAMILY="arch" ;;
-      ubuntu|debian|linuxmint|pop) DISTRO="$id"; DISTRO_FAMILY="debian" ;;
-      *) DISTRO="$id"; DISTRO_FAMILY="other" ;;
-    esac
-  else
+  if [[ ! -f /etc/os-release ]]; then
     die "Cannot detect OS  -  /etc/os-release not found."
   fi
+  local id
+  id=$(. /etc/os-release && echo "${ID:-unknown}")
+  case "$id" in
+    arch|manjaro|endeavouros|archarm|cachyos) DISTRO="$id"; DISTRO_FAMILY="arch" ;;
+    ubuntu|debian|linuxmint|pop|neon)         DISTRO="$id"; DISTRO_FAMILY="debian" ;;
+    *)                                        DISTRO="$id"; DISTRO_FAMILY="other" ;;
+  esac
   log "Detected: $DISTRO ($DISTRO_FAMILY)"
 }
 
-# ---- install mihomo ----
+# ---- mihomo install ----
 install_mihomo() {
   log "Installing mihomo..."
   if command -v mihomo &>/dev/null; then
@@ -186,69 +195,62 @@ install_mihomo() {
     return 0
   fi
   case "$DISTRO_FAMILY" in
-    arch)
-      install_mihomo_arch
-      ;;
-    debian)
-      install_mihomo_debian
-      ;;
-    *)
-      die "Unsupported distro  -  see README for manual install steps."
-      ;;
+    arch)   install_mihomo_arch ;;
+    debian) install_mihomo_binary ;;
+    *)      die "Unsupported distro '$DISTRO'  -  see README for manual steps." ;;
   esac
 }
 
 install_mihomo_arch() {
-  local needed=0
+  local needed=""
+  local pkg
   for pkg in base-devel git; do
-    pacman -Qi "$pkg" &>/dev/null || needed=1
+    pacman -Qi "$pkg" &>/dev/null || needed="$needed $pkg"
   done
-  if (( needed )); then
-    pacman -S --needed --noconfirm base-devel git || die "Failed to install base-devel"
+  if [[ -n "$needed" ]]; then
+    pacman -S --needed --noconfirm $needed || die "Failed to install:$needed"
   fi
   if ! command -v paru &>/dev/null && ! command -v yay &>/dev/null; then
     log "No AUR helper found  -  building paru..."
-    local tmpd
+    local tmpd user
     tmpd="$(mktemp -d)"
-    pushd "$tmpd" >/dev/null
-    git clone -c http.proxy="${http_proxy:-}" https://aur.archlinux.org/paru.git || {
-      # Fallback: binary install
-      popd >/dev/null; rm -rf "$tmpd"
-      install_mihomo_binary; return
-    }
-    cd paru
-    # makepkg must run as non-root
-    local user="${SUDO_USER:-${USER:-$(whoami)}}"
-    if [[ "$user" == "root" ]]; then
+    if ! git clone -c http.proxy="${http_proxy:-}" https://aur.archlinux.org/paru.git "$tmpd/paru"; then
+      rm -rf "$tmpd"
+      warn "Could not clone AUR  -  falling back to binary install"
+      install_mihomo_binary
+      return
+    fi
+    user="${SUDO_USER:-}"
+    if [[ -z "$user" || "$user" == "root" ]]; then
       user=$(logname 2>/dev/null || echo "nobody")
     fi
+    pushd "$tmpd/paru" >/dev/null
+    local build_ok=false
     if command -v runuser &>/dev/null; then
-      runuser -u "$user" -- makepkg -si --noconfirm
+      runuser -u "$user" -- makepkg -si --noconfirm && build_ok=true
     else
-      sudo -u "$user" makepkg -si --noconfirm
-    fi || {
-      popd >/dev/null; rm -rf "$tmpd"
+      sudo -u "$user" makepkg -si --noconfirm && build_ok=true
+    fi
+    popd >/dev/null
+    rm -rf "$tmpd"
+    if [[ "$build_ok" != true ]]; then
       warn "paru build failed  -  falling back to binary install"
-      install_mihomo_binary; return
-    }
-    popd >/dev/null; rm -rf "$tmpd"
+      install_mihomo_binary
+      return
+    fi
   fi
   local helper="paru"
   command -v paru &>/dev/null || helper="yay"
-  $helper -S --needed --noconfirm mihomo || {
+  if ! "$helper" -S --needed --noconfirm mihomo; then
     warn "AUR install failed  -  falling back to binary install"
-    install_mihomo_binary; return
-  }
-  # The AUR package ships mihomo.service
+    install_mihomo_binary
+    return
+  fi
   if [[ -f /usr/lib/systemd/system/mihomo.service ]]; then
     ok "systemd unit from package"
   else
-    write_mihomo_unit
+    write_mihomo_unit "/usr/bin/mihomo"
   fi
-}
-
-install_mihomo_debian() {
-  install_mihomo_binary
 }
 
 install_mihomo_binary() {
@@ -256,29 +258,31 @@ install_mihomo_binary() {
   case "$(uname -m)" in
     x86_64)  arch="amd64" ;;
     aarch64) arch="arm64" ;;
-    armv7l)  arch="armv7" ;;
     *) die "Unsupported architecture: $(uname -m)" ;;
   esac
   log "Downloading latest mihomo binary ($arch)..."
-  local tag asset url tmpd
+  local tmpd tag=""
   tmpd="$(mktemp -d)"
-  # Fetch latest release info
-  download "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" "$tmpd/release.json" \
-    || die "Failed to fetch latest mihomo release info"
-  tag=$(python3 -c "import json; print(json.load(open('$tmpd/release.json'))['tag_name'])" 2>/dev/null \
-    || grep '"tag_name"' "$tmpd/release.json" | head -1 | sed 's/.*"tag_name": "\(.*\)",/\1/')
-  asset="mihomo-linux-${arch}-${tag}.gz"
-  url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/${asset}"
-  download "$url" "$tmpd/mihomo.gz" || die "Failed to download mihomo binary"
+  if download "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" "$tmpd/release.json" \
+     && grep -q '"tag_name"' "$tmpd/release.json"; then
+    tag=$(grep '"tag_name"' "$tmpd/release.json" | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+  fi
+  if [[ -z "$tag" ]]; then
+    tag="$MIHOMO_PINNED"
+    warn "GitHub API unavailable  -  using pinned release $tag"
+  fi
+  local url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/mihomo-linux-${arch}-${tag}.gz"
+  download "$url" "$tmpd/mihomo.gz" || die "Failed to download mihomo binary ($tag)"
   gunzip -c "$tmpd/mihomo.gz" > /usr/local/bin/mihomo
   chmod +x /usr/local/bin/mihomo
   rm -rf "$tmpd"
-  write_mihomo_unit
+  write_mihomo_unit "/usr/local/bin/mihomo"
   ok "mihomo installed to /usr/local/bin/mihomo"
 }
 
 write_mihomo_unit() {
-  cat > /etc/systemd/system/mihomo.service <<'UNIT'
+  local bin="$1"
+  cat > /etc/systemd/system/mihomo.service <<UNIT
 [Unit]
 Description=mihomo Daemon, Another Clash Kernel.
 Documentation=https://wiki.metacubex.one
@@ -288,8 +292,8 @@ After=network.target nss-lookup.target network-online.target
 Type=simple
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_TIME CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_TIME CAP_SYS_PTRACE CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
-ExecStart=/usr/bin/env mihomo -d /etc/mihomo
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=$bin -d /etc/mihomo
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=infinity
@@ -297,93 +301,229 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 UNIT
-  systemctl daemon-reload
+  systemctl daemon-reload 2>/dev/null || true
 }
 
-# ---- detect wired interface ----
+# ---- wired interface detection ----
 detect_iface() {
   log "Detecting wired network interface..."
-  local ifaces
-  ifaces=($(ls /sys/class/net 2>/dev/null | grep -E '^(en|eth)' || true))
+  local -a ifaces=()
+  local d i
+  for d in /sys/class/net/*; do
+    i="${d##*/}"
+    [[ "$i" =~ ^(en|eth) ]] && ifaces+=("$i")
+  done
   if [[ ${#ifaces[@]} -eq 0 ]]; then
     warn "No ethernet interface found (en*/eth*)."
     return 1
   fi
-  local i iface
+  local iface=""
   for i in "${ifaces[@]}"; do
-    if [[ "$(cat /sys/class/net/$i/carrier 2>/dev/null)" == "1" ]]; then
+    if [[ "$(cat "/sys/class/net/$i/carrier" 2>/dev/null)" == "1" ]]; then
       iface="$i"; break
     fi
   done
   iface="${iface:-${ifaces[0]}}"
   WIRED_IFACE="$iface"
   ok "Interface: $WIRED_IFACE"
-  # Get NM connection name
-  WIRED_CONN=$(nmcli -g GENERAL.CONNECTION device show "$WIRED_IFACE" 2>/dev/null | head -1)
+
+  if ! command -v nmcli &>/dev/null; then
+    warn "NetworkManager not found  -  nmcli steps will be skipped."
+    WIRED_CONN=""
+    return 0
+  fi
+  WIRED_CONN=$(nmcli -g GENERAL.CONNECTION device show "$WIRED_IFACE" 2>/dev/null | head -1 || true)
   if [[ -z "$WIRED_CONN" ]]; then
-    # Try to find the active connection for this device
-    WIRED_CONN=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep ":$WIRED_IFACE$" | cut -d: -f1 | head -1)
+    WIRED_CONN=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep ":$WIRED_IFACE\$" | cut -d: -f1 | head -1 || true)
   fi
   if [[ -z "$WIRED_CONN" ]]; then
-    WIRED_CONN=$(nmcli -t -f NAME,TYPE con show 2>/dev/null | grep ':802-3-ethernet' | cut -d: -f1 | head -1)
+    WIRED_CONN=$(nmcli -t -f NAME,TYPE con show 2>/dev/null | grep ':802-3-ethernet' | cut -d: -f1 | head -1 || true)
   fi
   if [[ -n "$WIRED_CONN" ]]; then
     ok "NM connection: $WIRED_CONN"
   else
     warn "No NetworkManager ethernet connection profile found."
   fi
+  return 0
 }
 
-# ---- hostel picker ----
-pick_hostel() {
-  local -a names groups froms tos gws prefixes proxses pdfs
-  local line i=0
-  while IFS='|' read -r name group ip_from ip_to gw prefix proxies pdf rest; do
-    [[ "$name" =~ ^# ]] && continue
-    [[ -z "$name" ]] && continue
-    names[i]="$name"; groups[i]="$group"
-    froms[i]="$ip_from"; tos[i]="$ip_to"
-    gws[i]="$gw"; prefixes[i]="$prefix"
-    proxses[i]="$proxies"; pdfs[i]="$pdf"
-    i=$((i+1))
+# ---- hostel selection ----
+# Loads all rows from the TSV into indexed arrays.
+load_hostels() {
+  HOSTEL_NAMES=(); HOSTEL_GROUPS=(); HOSTEL_FROMS=(); HOSTEL_TOS=()
+  HOSTEL_GWS=(); HOSTEL_PREFIXES=(); HOSTEL_PROXIES=(); HOSTEL_PDFS=()
+  local name group ip_from ip_to gw prefix proxies pdf
+  while IFS='|' read -r name group ip_from ip_to gw prefix proxies pdf _; do
+    [[ "$name" =~ ^# || -z "$name" ]] && continue
+    HOSTEL_NAMES+=("$name");  HOSTEL_GROUPS+=("$group")
+    HOSTEL_FROMS+=("$ip_from"); HOSTEL_TOS+=("$ip_to")
+    HOSTEL_GWS+=("$gw");      HOSTEL_PREFIXES+=("$prefix")
+    HOSTEL_PROXIES+=("$proxies"); HOSTEL_PDFS+=("$pdf")
   done < "$TSV"
-  local count=$i
+}
+
+# Resolves a hostel by exact name (case-insensitive) or unique substring.
+# Sets SELECTED_* globals. Returns 1 if not found/ambiguous.
+resolve_hostel_by_name() {
+  local query="$1" idx
+  load_hostels
+  local matches=()
+  local i
+  for i in "${!HOSTEL_NAMES[@]}"; do
+    local lname="${HOSTEL_NAMES[i],,}"
+    local lquery="${query,,}"
+    if [[ "$lname" == "$lquery" || "$lname" == *"$lquery"* ]]; then
+      matches+=("$i")
+    fi
+  done
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    fail "No hostel matches '$query'."
+    echo "Available hostels:" >&2
+    for i in "${!HOSTEL_NAMES[@]}"; do echo "  - ${HOSTEL_NAMES[i]}" >&2; done
+    return 1
+  fi
+  if [[ ${#matches[@]} -gt 1 ]]; then
+    fail "'$query' matches multiple hostels  -  be more specific:"
+    for idx in "${matches[@]}"; do echo "  - ${HOSTEL_NAMES[idx]}" >&2; done
+    return 1
+  fi
+  idx="${matches[0]}"
+  SELECTED_HOSTEL_NAME="${HOSTEL_NAMES[idx]}"
+  SELECTED_HOSTEL_GW="${HOSTEL_GWS[idx]}"
+  SELECTED_HOSTEL_PREFIX="${HOSTEL_PREFIXES[idx]}"
+  SELECTED_HOSTEL_PROXIES="${HOSTEL_PROXIES[idx]}"
+  if ! in_range "$SELECTED_HOSTEL_IP" "${HOSTEL_FROMS[idx]}" "${HOSTEL_TOS[idx]}"; then
+    if [[ "$FLAG_FORCE" != true ]]; then
+      die "$SELECTED_HOSTEL_IP is outside ${SELECTED_HOSTEL_NAME}'s documented range (${HOSTEL_FROMS[idx]}–${HOSTEL_TOS[idx]}). Use --force to override."
+    fi
+    warn "IP outside documented range  -  proceeding (--force)"
+  fi
+  return 0
+}
+
+# Derives gateway/prefix after the IP is known (floor-wise handling).
+derive_network() {
+  if [[ "$SELECTED_HOSTEL_PREFIX" == "floorwise" ]]; then
+    local IFS=. a b c d
+    read -r a b c d <<< "$SELECTED_HOSTEL_IP"
+    if [[ "$SELECTED_HOSTEL_GW" == "floorwise" ]]; then
+      SELECTED_HOSTEL_GW="${a}.${b}.${c}.1"
+    fi
+    SELECTED_HOSTEL_PREFIX="24"
+  fi
+  if [[ -n "$FLAG_GATEWAY" ]]; then
+    SELECTED_HOSTEL_GW="$FLAG_GATEWAY"
+  fi
+}
+
+show_summary() {
+  echo ""
+  echo -e "${B}┌─ Configuration summary ──────────────────────────────${N}"
+  echo -e "${B}│${N} Hostel:  ${SELECTED_HOSTEL_NAME}"
+  echo -e "${B}│${N} IP:      ${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX}"
+  echo -e "${B}│${N} Gateway: ${SELECTED_HOSTEL_GW}"
+  echo -e "${B}│${N} DNS:     ${DNS_SRV}"
+  echo -e "${B}│${N} Proxies: ${SELECTED_HOSTEL_PROXIES} (port ${PROXY_PORT})"
+  echo -e "${B}└──────────────────────────────────────────────────────${N}"
+}
+
+# Interactive edit menu; loops until confirmed or cancelled.
+summary_edit_loop() {
+  while :; do
+    show_summary
+    if confirm "Everything correct?" "y"; then
+      return 0
+    fi
+    echo ""
+    echo "  [1] Re-enter IP"
+    echo "  [2] Change gateway"
+    echo "  [3] Change subnet prefix (CIDR)"
+    echo "  [4] Change proxy list"
+    echo "  [5] Start over  -  pick a different hostel"
+    echo "  [6] Cancel install"
+    echo ""
+    local choice
+    choice=$(ask "Enter number" "")
+    case "$choice" in
+      1)
+        while :; do
+          local ip
+          ip=$(ask "Enter the assigned IP" "$SELECTED_HOSTEL_IP")
+          if valid_ip "$ip"; then SELECTED_HOSTEL_IP="$ip"; break; fi
+          warn "Not a valid IP address"
+        done
+        ;;
+      2)
+        while :; do
+          local gw
+          gw=$(ask "Enter gateway IP" "$SELECTED_HOSTEL_GW")
+          if valid_ip "$gw"; then SELECTED_HOSTEL_GW="$gw"; break; fi
+          warn "Not a valid IP address"
+        done
+        ;;
+      3)
+        while :; do
+          local pfx
+          pfx=$(ask "Enter prefix length (8-32)" "$SELECTED_HOSTEL_PREFIX")
+          if [[ "$pfx" =~ ^([8-9]|[12][0-9]|3[0-2])$ ]]; then SELECTED_HOSTEL_PREFIX="$pfx"; break; fi
+          warn "Prefix must be 8-32"
+        done
+        ;;
+      4)
+        while :; do
+          local pl
+          pl=$(ask "Proxies (comma-separated IPs)" "$SELECTED_HOSTEL_PROXIES")
+          local IFS=',' ok_all=true p
+          read -ra plist <<< "$pl"
+          for p in "${plist[@]}"; do
+            valid_ip "$p" || ok_all=false
+          done
+          if [[ "$ok_all" == true && ${#plist[@]} -gt 0 ]]; then
+            SELECTED_HOSTEL_PROXIES="$pl"; break
+          fi
+          warn "All entries must be valid comma-separated IPs"
+        done
+        ;;
+      5) pick_hostel; return 0 ;;
+      6) die "Cancelled by user." ;;
+      *) warn "Invalid choice" ;;
+    esac
+  done
+}
+
+pick_hostel() {
+  load_hostels
+  local count=${#HOSTEL_NAMES[@]}
   log "Select your hostel/hall:"
   echo ""
-  # Print grouped
-  local prev_group="" idx=0
-  for ((i=0; i<count; i++)); do
-    if [[ "${groups[i]}" != "$prev_group" ]]; then
-      echo -e "${B}--- ${groups[i]} ---${N}"
-      prev_group="${groups[i]}"
+  local prev_group="" i
+  for i in "${!HOSTEL_NAMES[@]}"; do
+    if [[ "${HOSTEL_GROUPS[i]}" != "$prev_group" ]]; then
+      echo -e "${B}--- ${HOSTEL_GROUPS[i]} ---${N}"
+      prev_group="${HOSTEL_GROUPS[i]}"
     fi
-    printf "  %2d) %s\n" $((i+1)) "${names[i]}"
+    printf "  %2d) %s\n" $((i+1)) "${HOSTEL_NAMES[i]}"
   done
   echo ""
   local choice
   while :; do
     choice=$(ask "Enter number" "")
-    [[ -z "$choice" ]] && continue
-    local re='^[0-9]+$'
-    if [[ "$choice" =~ $re ]] && ((choice >= 1 && choice <= count)); then
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
       break
     fi
     warn "Enter a number between 1 and $count"
   done
   local idx=$((choice-1))
-  SELECTED_HOSTEL_NAME="${names[idx]}"
-  SELECTED_HOSTEL_GW="${gws[idx]}"
-  SELECTED_HOSTEL_PREFIX="${prefixes[idx]}"
-  SELECTED_HOSTEL_PROXIES="${proxses[idx]}"
-  local pdf="${pdfs[idx]}"
-  local ip_from="${froms[idx]}" ip_to="${tos[idx]}"
+  SELECTED_HOSTEL_NAME="${HOSTEL_NAMES[idx]}"
+  SELECTED_HOSTEL_GW="${HOSTEL_GWS[idx]}"
+  SELECTED_HOSTEL_PREFIX="${HOSTEL_PREFIXES[idx]}"
+  SELECTED_HOSTEL_PROXIES="${HOSTEL_PROXIES[idx]}"
+  local ip_from="${HOSTEL_FROMS[idx]}" ip_to="${HOSTEL_TOS[idx]}" pdf="${HOSTEL_PDFS[idx]}"
 
   echo ""
-  echo -e "${B}${C}📄  Find your room's IP here:${N}"
+  echo -e "${B}${C}📄  Find your room's IP here (open on phone/PC):${N}"
   echo -e "${C}   $pdf${N}"
-  echo -e "${Y}   Press Enter after you've opened it and found your IP.${N}"
-  echo ""
-  ask "Press Enter to continue" ""
+  ask "Press Enter when you have it" ""
 
   while :; do
     local ip
@@ -392,225 +532,253 @@ pick_hostel() {
       warn "IP cannot be empty"
       continue
     fi
-    if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    if ! valid_ip "$ip"; then
       warn "Not a valid IP address"
       continue
     fi
     if in_range "$ip" "$ip_from" "$ip_to"; then
       SELECTED_HOSTEL_IP="$ip"
       break
-    else
-      echo -e "${Y}⚠  $ip is outside ${SELECTED_HOSTEL_NAME}'s documented range (${ip_from}–${ip_to}).${N}"
-      if confirm "The college PDF may be outdated. Still use this IP?" "y"; then
-        SELECTED_HOSTEL_IP="$ip"
-        break
-      else
-        echo "Let's try again."
-      fi
     fi
+    echo -e "${Y}⚠  $ip is outside ${SELECTED_HOSTEL_NAME}'s documented range (${ip_from}–${ip_to}).${N}"
+    if confirm "The college PDF may be outdated. Still use this IP?" "y"; then
+      SELECTED_HOSTEL_IP="$ip"
+      break
+    fi
+    echo "Let's try again."
   done
 
-  # Compute gateway for floorwise hostels
-  if [[ "$SELECTED_HOSTEL_GW" == "floorwise" ]]; then
-    # Derive gateway from /24 of the entered IP
-    local IFS=. a b c d
-    read -r a b c d <<< "$SELECTED_HOSTEL_IP"
-    SELECTED_HOSTEL_GW="${a}.${b}.${c}.1"
-    SELECTED_HOSTEL_PREFIX="24"
-    echo -e "${Y}  ⓘ  Floor-wise subnet  -  gateway set to ${SELECTED_HOSTEL_GW}${N}"
-    if ! confirm "Is this correct?" "y"; then
-      SELECTED_HOSTEL_GW=$(ask "Enter gateway IP" "")
+  derive_network
+
+  # Floor-wise subnets (SVBH): the derived gateway is a guess  -  require explicit yes
+  if [[ "${HOSTEL_PREFIXES[idx]}" == "floorwise" ]]; then
+    echo -e "${Y}  ⓘ  ${SELECTED_HOSTEL_NAME} uses floor-wise subnets  -  gateway below is derived, verify it!${N}"
+    if ! confirm "Use derived gateway ${SELECTED_HOSTEL_GW}?" "n"; then
+      while :; do
+        local gw
+        gw=$(ask "Enter the gateway from your floor's PDF" "")
+        if valid_ip "$gw"; then SELECTED_HOSTEL_GW="$gw"; break; fi
+        warn "Not a valid IP address"
+      done
     fi
   fi
 
-  ok "Hostel: $SELECTED_HOSTEL_NAME"
-  ok "IP: $SELECTED_HOSTEL_IP / $SELECTED_HOSTEL_PREFIX  GW: $SELECTED_HOSTEL_GW"
-  ok "Proxies: $SELECTED_HOSTEL_PROXIES"
+  summary_edit_loop
+  ok "Selected: $SELECTED_HOSTEL_NAME  -  $SELECTED_HOSTEL_IP/$SELECTED_HOSTEL_PREFIX via $SELECTED_HOSTEL_GW"
 }
 
-# ---- generate mihomo config ----
+# Unattended selection path (--hostel + --ip + --yes)
+unattended_pick() {
+  SELECTED_HOSTEL_IP="$FLAG_IP"
+  if ! resolve_hostel_by_name "$FLAG_HOSTEL"; then
+    exit 1
+  fi
+  derive_network
+  ok "Unattended: $SELECTED_HOSTEL_NAME  -  $SELECTED_HOSTEL_IP/$SELECTED_HOSTEL_PREFIX via $SELECTED_HOSTEL_GW"
+}
+
+# ---- config generation ----
 gen_config() {
   log "Generating mihomo config..."
   local proxy_entries="" proxy_names=""
-  local IFS=',' p name
-  local idx=0
-  for p in $SELECTED_HOSTEL_PROXIES; do
+  local idx=0 p name
+  local IFS=,
+  read -ra plist <<< "$SELECTED_HOSTEL_PROXIES"
+  unset IFS
+  for p in "${plist[@]}"; do
+    p="${p//[[:space:]]/}"
     idx=$((idx+1))
     name="proxy-${idx}"
     proxy_entries+="  - {name: ${name}, type: http, server: ${p}, port: ${PROXY_PORT}, username: ${PROXY_USER}, password: ${PROXY_PASS}}"$'\n'
     [[ -n "$proxy_names" ]] && proxy_names+=", "
     proxy_names+="${name}"
   done
-  PROXY_NAMES="$proxy_names"
 
-  # Render template by replacing {{PLACEHOLDERS}} with python3 (handles newlines).
-  # envsubst can't be used here because PROXY_ENTRIES contains YAML blocks easily,
-  # and sed chokes on multi-line replacement.
+  local tun_enable="true"
+  if [[ "$FLAG_NO_TUN" == true ]]; then
+    tun_enable="false"
+  fi
+
   mkdir -p /etc/mihomo
   local rendered
-  rendered=$(python3 -c '
+  rendered=$(python3 - "$proxy_entries" "$proxy_names" "$tun_enable" "$TEMPLATE" <<'PYEOF'
 import sys
-proxy_entries = sys.argv[1]
-proxy_names   = sys.argv[2]
-template_path = sys.argv[3]
+proxy_entries, proxy_names, tun_enable, template_path = sys.argv[1:5]
 with open(template_path) as f:
     t = f.read()
 t = t.replace("{{PROXY_ENTRIES}}", proxy_entries.rstrip("\n"))
 t = t.replace("{{PROXY_NAMES}}", proxy_names)
+t = t.replace("{{TUN_ENABLE}}", tun_enable)
 sys.stdout.write(t)
-' "$proxy_entries" "$proxy_names" "$TEMPLATE") || die "Failed to render config"
+PYEOF
+  ) || die "Failed to render config"
   printf '%s\n' "$rendered" > /etc/mihomo/config.yaml
   chmod 600 /etc/mihomo/config.yaml
-  # Validate
-  mihomo -t -d /etc/mihomo 2>&1 || die "Config validation failed  -  check /etc/mihomo/config.yaml"
-  ok "Config generated and validated"
+  mihomo -t -d /etc/mihomo >/dev/null 2>&1 || {
+    mihomo -t -d /etc/mihomo 2>&1 || true
+    die "Config validation failed  -  see errors above"
+  }
+  ok "Config generated and validated (tun: $tun_enable)"
 }
 
-# ---- configure static IP ----
+# ---- static IP via NetworkManager ----
 apply_ip() {
-  if [[ -z "$WIRED_CONN" ]]; then
-    warn "No NetworkManager connection found  -  skipping static IP config."
-    warn "Set your IP manually: nmcli con mod <name> ipv4.method manual ipv4.addresses IP/prefix ipv4.gateway GW ipv4.dns \"$DNS_SRV\""
-    return
+  if [[ "$FLAG_SKIP_IP" == true ]]; then
+    warn "Skipping network changes (--skip-ip)"
+    return 0
   fi
-  log "Setting static IP..."
+  if [[ -z "$WIRED_CONN" ]]; then
+    warn "No NetworkManager connection profile  -  set the IP manually:"
+    warn "  nmcli con mod <name> ipv4.method manual ipv4.addresses ${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX} ipv4.gateway ${SELECTED_HOSTEL_GW} ipv4.dns \"${DNS_SRV_LIST}\""
+    return 0
+  fi
+  log "Setting static IP on '$WIRED_CONN'..."
   nmcli con mod "$WIRED_CONN" \
     ipv4.method manual \
     ipv4.addresses "${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX}" \
     ipv4.gateway "$SELECTED_HOSTEL_GW" \
     ipv4.dns "$DNS_SRV_LIST"
-  # Check carrier (cable plugged?)
   local carrier
-  carrier=$(cat /sys/class/net/"$WIRED_IFACE"/carrier 2>/dev/null || echo 0)
+  carrier=$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null || echo 0)
   if [[ "$carrier" == "1" ]]; then
     nmcli con down "$WIRED_CONN" 2>/dev/null || true
-    nmcli con up "$WIRED_CONN" 2>/dev/null || warn "Connection activation failed  -  check cable?"
+    nmcli con up "$WIRED_CONN" || warn "Connection activation failed  -  check cable"
     ok "Static IP applied"
   else
-    warn "Cable not plugged in  -  saved IP config. It will activate when you plug in at hostel."
-    # Try to reactivate anyway (nmcli up will fail gracefully)
     nmcli con up "$WIRED_CONN" 2>/dev/null || true
+    warn "Cable not plugged in  -  config saved; it activates when you plug in at hostel."
   fi
 }
 
-# ---- install LAN watcher ----
+# ---- LAN watcher ----
 install_watcher() {
-  if ! confirm "Auto-start/stop mihomo when LAN cable plugs/unplugs?" "y"; then
-    warn "LAN watcher skipped  -  remember to stop mihomo manually when off campus."
+  if [[ "$FLAG_NO_LAN_WATCH" == true ]]; then
+    warn "LAN watcher skipped (--no-lan-watch)  -  mihomo will auto-start at boot."
     systemctl enable mihomo 2>/dev/null || true
-    return
+    return 0
+  fi
+  if [[ "$FLAG_YES" != true ]]; then
+    if ! confirm "Auto-start/stop mihomo when LAN cable plugs/unplugs? (recommended)" "y"; then
+      systemctl enable mihomo 2>/dev/null || true
+      warn "LAN watcher skipped  -  remember to stop mihomo manually off-campus."
+      return 0
+    fi
   fi
   if [[ ! -f "$DISPATCHER" ]]; then
     warn "Dispatcher script not found  -  skipping LAN watcher."
     systemctl enable mihomo 2>/dev/null || true
-    return
+    return 0
   fi
   log "Installing LAN watcher..."
   mkdir -p /etc/NetworkManager/dispatcher.d
-  cp "$DISPATCHER" /etc/NetworkManager/dispatcher.d/90-mihomo-lan
-  chown root:root /etc/NetworkManager/dispatcher.d/90-mihomo-lan
-  chmod 755 /etc/NetworkManager/dispatcher.d/90-mihomo-lan
-  # Reload NM config (not restart, to avoid dropping connections)
+  install -m 755 -o root -g root "$DISPATCHER" /etc/NetworkManager/dispatcher.d/90-mihomo-lan
   nmcli general reload 2>/dev/null || systemctl reload NetworkManager 2>/dev/null || true
-  # Disable mihomo boot autostart  -  dispatcher controls lifecycle
-  systemctl disable mihomo 2>/dev/null || true
+  systemctl disable mihomo 2>/dev/null || true   # dispatcher owns start/stop now
   ok "LAN watcher installed  -  mihomo starts/stops automatically with campus LAN"
-  echo -e "${Y}  ⓘ  Behavior: plug in at hostel → start proxy. Unplug or go home → stop.${N}"
+  echo -e "${Y}  ⓘ  Plug in at hostel → start. Unplug or go home → stop.${N}"
 }
 
-# ---- verify ----
+# ---- verification ----
 verify() {
   log "Verifying..."
   echo ""
-  local carrier=0
-  carrier=$(cat /sys/class/net/"$WIRED_IFACE"/carrier 2>/dev/null || echo 0)
-  if [[ "$carrier" != "1" ]]; then
-    warn "LAN cable not plugged in  -  skipping live verification."
-    echo -e "${Y}  The proxy will work when you plug in at hostel.${N}"
-    echo -e "${Y}  Run 'sudo systemctl start mihomo' or just plug the cable.${N}"
-    return
+  if [[ "$FLAG_SKIP_IP" != true ]]; then
+    local carrier
+    carrier=$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null || echo 0)
+    if [[ "$carrier" != "1" ]]; then
+      warn "LAN cable not plugged in  -  skipping live verification."
+      echo -e "${Y}  Plug in at hostel and the proxy starts automatically.${N}"
+      return 0
+    fi
   fi
-  # 1. Service
   sleep 2
-  if systemctl is-active --quiet mihomo; then ok "mihomo service  -  active"
-  else fail "mihomo service  -  not active"; fi
-  # 2. TUN
-  if ip link show Meta &>/dev/null || ip link show utun &>/dev/null; then ok "TUN interface  -  present"
-  else fail "TUN interface  -  not found"; fi
-  # 3. Egress IP
+  if systemctl is-active --quiet mihomo; then
+    ok "mihomo service  -  active"
+  else
+    fail "mihomo service  -  not active"
+  fi
+  if [[ "$FLAG_NO_TUN" != true ]]; then
+    if ip link show Meta &>/dev/null; then
+      ok "TUN interface  -  present"
+    else
+      fail "TUN interface  -  not found"
+    fi
+  fi
   local egress=""
+  local ep
   for ep in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com" "https://ip.sb"; do
     egress=$(curl -fsS --max-time 8 "$ep" 2>/dev/null || true)
     [[ -n "$egress" ]] && break
   done
-  if [[ -n "$egress" ]]; then ok "External IP: $egress"
-  else fail "External IP check failed"
+  if [[ -n "$egress" ]]; then
+    ok "Connectivity OK  -  external IP: $egress"
+  else
+    fail "Direct connectivity check failed"
   fi
-  # 4. Google
-  if curl -fsS --max-time 10 -o /dev/null https://google.com 2>/dev/null; then ok "Google  -  reachable"
-  else fail "Google  -  not reachable"
+  # Proxy chain test (works with or without TUN)
+  if curl -fsS --max-time 10 -x "http://127.0.0.1:7890" -o /dev/null https://www.google.com; then
+    ok "Proxy chain (127.0.0.1:7890 → upstream)  -  working"
+  else
+    fail "Proxy chain test failed  -  is the campus proxy reachable?"
   fi
   echo ""
   if [[ -n "$egress" ]]; then
-    echo -e "${G}${B}┌──────────────────────────────────────────┐${N}"
-    echo -e "${G}${B}│  ✅ DONE  -  internet through college proxy  │${N}"
-    echo -e "${G}${B}│  External IP: $egress${N}"
-    echo -e "${G}${B}└──────────────────────────────────────────┘${N}"
+    echo -e "${G}${B}┌──────────────────────────────────────────────┐${N}"
+    echo -e "${G}${B}│  ✅ DONE  -  internet through college proxy    │${N}"
+    echo -e "${G}${B}│  External IP: $egress"
+    echo -e "${G}${B}└──────────────────────────────────────────────┘${N}"
     echo ""
     print_limitations
-    echo ""
-    echo -e "${B}Commands:${N}"
-    echo -e "  mnnit-proxy-update   (change hostel/IP later)"
-    echo -e "  journalctl -u mihomo -f  (live logs)"
-    echo -e "  cat /opt/mnnit-proxy/README  (offline help)"
   else
-    warn "Verification incomplete  -  check cable and rerun 'sudo bash install.sh --diagnose'"
+    warn "Verification incomplete  -  run 'sudo bash install.sh --diagnose' for details."
   fi
 }
 
 print_limitations() {
   echo -e "${Y}┌─ ⚠ GOOD TO KNOW ─────────────────────────────────────────┐${N}"
-  echo -e "${Y}│ The college proxy carries TCP only (same as Proxifier).   │${N}"
+  echo -e "${Y}│ The college proxy carries TCP only (same as Proxifier).  │${N}"
   echo -e "${Y}│                                                          │${N}"
-  echo -e "${Y}│ ✗ ping google.com            → use curl https://google.com ${N}"
-  echo -e "${Y}│ ✗ traceroute                 → ICMP can't pass the proxy  ${N}"
-  echo -e "${Y}│ ✗ Discord voice / online     → need UDP, TCP-only here    ${N}"
-  echo -e "${Y}│ ✗ Torrents / P2P             → blocked (UDP + inbound)    ${N}"
-  echo -e "${Y}│                                                          ${N}"
-  echo -e "${Y}│ Everything else (browsers, git, npm, pip, SSH…) works    ${N}"
-  echo -e "${Y}│ automatically in ALL apps  -  no per-app setup needed.     ${N}"
+  echo -e "${Y}│ ✗ ping google.com        → use curl https://google.com   │${N}"
+  echo -e "${Y}│ ✗ traceroute             → ICMP can't pass the proxy     │${N}"
+  echo -e "${Y}│ ✗ Discord voice / games  → they need UDP, TCP-only here  │${N}"
+  echo -e "${Y}│ ✗ Torrents / P2P         → blocked (UDP + inbound)       │${N}"
+  echo -e "${Y}│                                                          │${N}"
+  echo -e "${Y}│ Everything else (browsers, git, npm, pip, curl, SSH…)    │${N}"
+  echo -e "${Y}│ works normally  -  in ALL apps, no per-app setup.          │${N}"
   echo -e "${Y}└──────────────────────────────────────────────────────────┘${N}"
 }
 
-# ---- self-install to /opt ----
+# ---- self-install for offline use ----
 self_install() {
   log "Saving toolkit for offline use..."
   mkdir -p /opt/mnnit-proxy
-  cp "$TSV" /opt/mnnit-proxy/hostels.tsv 2>/dev/null || true
-  cp "$TEMPLATE" /opt/mnnit-proxy/config.template.yaml 2>/dev/null || true
-  local updater="${SCRIPT_DIR}/update.sh"
+  cp "$TSV" /opt/mnnit-proxy/hostels.tsv
+  cp "$TEMPLATE" /opt/mnnit-proxy/config.template.yaml
+  local updater="$SCRIPT_DIR/update.sh"
   if [[ -f "$updater" ]]; then
     cp "$updater" /opt/mnnit-proxy/update.sh
     chmod +x /opt/mnnit-proxy/update.sh
   fi
-  [[ -f "$DISPATCHER" ]] && cp "$DISPATCHER" /opt/mnnit-proxy/90-mihomo-lan 2>/dev/null || true
-  # Create wrapper
+  if [[ -f "$DISPATCHER" ]]; then
+    cp "$DISPATCHER" /opt/mnnit-proxy/90-mihomo-lan
+  fi
+  if [[ -f "$SCRIPT_DIR/README.md" ]]; then
+    cp "$SCRIPT_DIR/README.md" /opt/mnnit-proxy/README.md
+  fi
   cat > /usr/local/bin/mnnit-proxy-update <<'WRAP'
 #!/usr/bin/env bash
 exec sudo bash /opt/mnnit-proxy/update.sh "$@"
 WRAP
   chmod +x /usr/local/bin/mnnit-proxy-update
-  ok "Toolkit saved to /opt/mnnit-proxy"
-  ok "Run 'mnnit-proxy-update' anytime to change hostel/IP"
+  ok "Saved to /opt/mnnit-proxy  -  'mnnit-proxy-update' works offline"
 }
 
-# ---- diagnose ----
+# ---- diagnostics ----
 diagnose() {
-  echo -e "${B}${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "${B}${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "${B}${C}  mnnit-proxy diagnostics${N}"
-  echo -e "${B}${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "${B}${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo ""
-  # 1. Service
   if systemctl is-active --quiet mihomo 2>/dev/null; then
     ok "mihomo service is running"
   else
@@ -618,67 +786,60 @@ diagnose() {
     echo "   Fix: sudo systemctl start mihomo"
   fi
   echo ""
-  # 2. TUN
   if ip link show Meta &>/dev/null; then
     ok "TUN interface (Meta) exists"
   else
-    fail "TUN interface (Meta) not found"
-    echo "   Fix: mihomo may not have started  -  check logs: journalctl -u mihomo -n 20"
+    warn "TUN interface (Meta) not found (normal with --no-tun or when stopped)"
   fi
   echo ""
-  # 3. Config valid
-  if mihomo -t -d /etc/mihomo 2>&1 | grep -q "test is successful"; then
+  if mihomo -t -d /etc/mihomo >/dev/null 2>&1; then
     ok "Config is valid"
   else
-    fail "Config has errors"
-    mihomo -t -d /etc/mihomo 2>&1
+    fail "Config has errors:"
+    mihomo -t -d /etc/mihomo 2>&1 | head -5 || true
   fi
   echo ""
-  # 4. Interface
   detect_iface || true
   if [[ -n "$WIRED_IFACE" ]]; then
-    local ip gw
-    ip=$(ip -4 addr show "$WIRED_IFACE" 2>/dev/null | grep inet | awk '{print $2}' | head -1)
-    gw=$(ip route show default dev "$WIRED_IFACE" 2>/dev/null | awk '{print $3}')
+    local ip gw carrier
+    ip=$(ip -4 addr show "$WIRED_IFACE" 2>/dev/null | awk '/inet /{print $2; exit}')
+    gw=$(ip route show default dev "$WIRED_IFACE" 2>/dev/null | awk '{print $3; exit}')
+    carrier=$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null || echo 0)
     echo "   IP: ${ip:-none}"
     echo "   Gateway: ${gw:-none}"
-    if ip link show "$WIRED_IFACE" 2>/dev/null | grep -q "state UP"; then
-      local carrier
-      carrier=$(cat /sys/class/net/"$WIRED_IFACE"/carrier 2>/dev/null || echo 0)
-      if [[ "$carrier" == "1" ]]; then ok "Cable connected"
-      else fail "Cable NOT connected"
-      fi
+    if [[ "$carrier" == "1" ]]; then
+      ok "Cable connected"
     else
-      fail "Interface $WIRED_IFACE is down"
+      fail "Cable NOT connected"
+    fi
+    if [[ "$gw" == 172.31.* ]]; then
+      ok "On campus network"
+    else
+      warn "Gateway is not campus (172.31.*)  -  proxy can't work here"
     fi
   fi
   echo ""
-  # 5. Proxy reachability
   echo -e "${B}Proxy reachability:${N}"
-  local IFS=',' proxies=($SELECTED_HOSTEL_PROXIES)
-  if [[ ${#proxies[@]} -eq 0 ]]; then
-    # Try to read from config
-    local proxy_line
-    proxy_line=$(grep -oP 'server: \K[0-9.]+' /etc/mihomo/config.yaml 2>/dev/null | head -5 || true)
-    if [[ -n "$proxy_line" ]]; then
-      IFS=$'\n' proxies=($proxy_line)
-    else
-      proxies=("172.31.100.25" "172.31.100.27" "172.31.100.30")
-    fi
+  local proxies=()
+  if [[ -n "$SELECTED_HOSTEL_PROXIES" ]]; then
+    local IFS=,
+    read -ra proxies <<< "$SELECTED_HOSTEL_PROXIES"
+    unset IFS
+  elif [[ -f /etc/mihomo/config.yaml ]]; then
+    mapfile -t proxies < <(grep -oP 'server: \K[0-9.]+' /etc/mihomo/config.yaml | head -6)
   fi
-  local any_reachable=0
+  local any_reachable=false p
   for p in "${proxies[@]}"; do
-    p=$(echo "$p" | xargs)
+    if [[ -z "$p" ]]; then continue; fi
     if timeout 5 bash -c "echo > /dev/tcp/${p}/${PROXY_PORT}" 2>/dev/null; then
       ok "  ${p}:${PROXY_PORT}  -  reachable"
-      any_reachable=1
+      any_reachable=true
     else
       fail "  ${p}:${PROXY_PORT}  -  UNREACHABLE"
     fi
   done
   echo ""
-  # 6. Internet test
-  if (( any_reachable )); then
+  if [[ "$any_reachable" == true ]]; then
     local egress=""
     for ep in "https://ifconfig.me" "https://api.ipify.org"; do
       egress=$(curl -fsS --max-time 8 "$ep" 2>/dev/null || true)
@@ -687,22 +848,24 @@ diagnose() {
     if [[ -n "$egress" ]]; then
       ok "Internet works  -  external IP: $egress"
     else
-      fail "Internet test failed"
-      echo "   Check: journalctl -u mihomo -n 30 | tail -20"
+      fail "Internet test failed  -  check: journalctl -u mihomo -n 30"
     fi
   else
-    warn "No proxy reachable  -  internet test skipped (expected if off campus)"
+    warn "No proxy reachable  -  expected if off campus"
   fi
   echo ""
-  echo -e "${Y}${B}Note: ping fails through proxy  -  that's normal. Use curl to test.${N}"
+  echo -e "${Y}Note: ping failing through the proxy is normal  -  use curl instead.${N}"
   echo ""
   ask "Press Enter to continue" ""
 }
 
 # ---- uninstall ----
 uninstall() {
-  log "Uninstalling..."
-  if confirm "Restore DHCP (remove static IP)?" "y"; then
+  log "Uninstalling mnnit-proxy..."
+  if [[ "$FLAG_YES" != true ]] && ! confirm "Restore DHCP (remove static IP)?" "y"; then
+    :
+  else
+    detect_iface || true
     if [[ -n "$WIRED_CONN" ]]; then
       nmcli con mod "$WIRED_CONN" ipv4.method auto ipv4.addresses "" ipv4.gateway "" 2>/dev/null || true
       nmcli con up "$WIRED_CONN" 2>/dev/null || true
@@ -716,40 +879,46 @@ uninstall() {
   rm -rf /opt/mnnit-proxy
   rm -f /usr/local/bin/mnnit-proxy-update
   if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-    if confirm "Remove mihomo binary?" "n"; then
-      rm -f /usr/local/bin/mihomo
-      rm -f /etc/systemd/system/mihomo.service
-      systemctl daemon-reload
+    if [[ "$FLAG_YES" == true ]] || confirm "Remove mihomo binary?" "n"; then
+      rm -f /usr/local/bin/mihomo /etc/systemd/system/mihomo.service
+      systemctl daemon-reload 2>/dev/null || true
     fi
-  fi
-  if [[ "$DISTRO_FAMILY" == "arch" ]]; then
-    if confirm "Remove mihomo package?" "n"; then
-      paru -R --noconfirm mihomo 2>/dev/null || yay -R --noconfirm mihomo 2>/dev/null || true
+  elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
+    if [[ "$FLAG_YES" == true ]] || confirm "Remove mihomo package?" "n"; then
+      local helper=""
+      command -v paru &>/dev/null && helper="paru"
+      command -v yay &>/dev/null && helper="yay"
+      [[ -n "$helper" ]] && "$helper" -R --noconfirm mihomo 2>/dev/null || true
     fi
   fi
   nmcli general reload 2>/dev/null || true
   ok "Uninstall complete"
 }
 
-# ---- main flow ----
+# ---- main flows ----
 main_install() {
-  log "mnnit-proxy installer v$VERSION"
+  log "mnnit-proxy installer v$APP_VERSION"
   echo ""
   ensure_data
   boot_internet
   detect_distro
   install_mihomo
-  detect_iface
-  pick_hostel
+  detect_iface || true
+
+  if [[ -n "$FLAG_HOSTEL" && -n "$FLAG_IP" && "$FLAG_YES" == true ]]; then
+    unattended_pick
+  else
+    pick_hostel
+  fi
+
   apply_ip
-  # Generate config before start so service has valid config
   gen_config
   install_watcher
-  # Start mihomo (if LAN watcher is installed, it starts on cable up; but also start now if cable connected)
-  if systemctl is-enabled mihomo 2>/dev/null | grep -q "enabled"; then
+
+  # Start service: dispatcher mode keeps it disabled, direct mode enables at boot
+  if systemctl is-enabled mihomo 2>/dev/null | grep -q "^enabled$"; then
     systemctl enable --now mihomo 2>/dev/null || true
   else
-    # Dispatcher mode  -  try starting now if campus
     systemctl start mihomo 2>/dev/null || true
   fi
   verify
@@ -759,10 +928,20 @@ main_install() {
   echo -e "${B}Run 'mnnit-proxy-update' to change hostel/IP settings later.${N}"
 }
 
-# ---- menu (re-run) ----
+run_update() {
+  local updater="$SCRIPT_DIR/update.sh"
+  if [[ ! -f "$updater" && -f /opt/mnnit-proxy/update.sh ]]; then
+    updater="/opt/mnnit-proxy/update.sh"
+  fi
+  if [[ ! -f "$updater" ]]; then
+    die "update.sh not found  -  reinstall the repo first."
+  fi
+  exec bash "$updater" "$@"
+}
+
 show_menu() {
   echo -e "${B}${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "${B}${C}  mnnit-proxy v${VERSION}${N}"
+  echo -e "${B}${C}  mnnit-proxy v${APP_VERSION}${N}"
   echo -e "${B}${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo ""
   echo "  [1] Full install / reinstall"
@@ -771,71 +950,68 @@ show_menu() {
   echo "  [4] Uninstall"
   echo "  [5] Exit"
   echo ""
-  local choice=$(ask "Enter number" "1")
+  local choice
+  choice=$(ask "Enter number" "1")
   case "$choice" in
     1) main_install ;;
     2) run_update ;;
     3) diagnose ;;
-    4) uninstall ;;
+    4) detect_distro; detect_iface || true; uninstall ;;
     5) exit 0 ;;
     *) warn "Invalid choice"; show_menu ;;
   esac
 }
 
-run_update() {
-  local updater="${SCRIPT_DIR}/update.sh"
-  if [[ -f "$updater" ]]; then
-    exec bash "$updater" "$@"
-  elif [[ -f /opt/mnnit-proxy/update.sh ]]; then
-    exec bash /opt/mnnit-proxy/update.sh "$@"
+parse_flags() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hostel)         [[ $# -lt 2 ]] && die "--hostel needs a value"; FLAG_HOSTEL="$2"; shift 2 ;;
+      --ip)             [[ $# -lt 2 ]] && die "--ip needs a value"; FLAG_IP="$2"; shift 2 ;;
+      --gateway)        [[ $# -lt 2 ]] && die "--gateway needs a value"; FLAG_GATEWAY="$2"; shift 2 ;;
+      --yes|-y)         FLAG_YES=true; shift ;;
+      --force)          FLAG_FORCE=true; shift ;;
+      --skip-ip)        FLAG_SKIP_IP=true; shift ;;
+      --no-tun)         FLAG_NO_TUN=true; shift ;;
+      --no-lan-watch)   FLAG_NO_LAN_WATCH=true; shift ;;
+      --non-interactive) FLAG_YES=true; shift ;;
+      --uninstall)      FLAG_UNINSTALL=true; shift ;;
+      --diagnose)       FLAG_DIAGNOSE=true; shift ;;
+      -h|--help)        sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+      *)                die "Unknown flag: $1" ;;
+    esac
+  done
+}
+
+main() {
+  parse_flags "$@"
+  if [[ "${FLAG_UNINSTALL:-false}" == true ]]; then
+    [[ $EUID -eq 0 ]] || die "Run with sudo."
+    detect_distro
+    detect_iface || true
+    uninstall
+    return 0
+  fi
+  if [[ "${FLAG_DIAGNOSE:-false}" == true ]]; then
+    [[ $EUID -eq 0 ]] || die "Run with sudo."
+    detect_iface || true
+    diagnose
+    return 0
+  fi
+  if [[ $EUID -ne 0 ]]; then
+    if [[ -r /dev/tty ]]; then
+      warn "This script needs root. Re-running with sudo..."
+      exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+    fi
+    die "This script needs root. Run: curl -fsSL <URL> | sudo bash"
+  fi
+  if command -v mihomo &>/dev/null || [[ -f /etc/mihomo/config.yaml ]]; then
+    show_menu
   else
-    die "update.sh not found  -  reinstall the repo or run: curl -fsSL <URL>/update.sh | sudo bash"
+    main_install
   fi
 }
 
-# ---- entry point ----
-if (( EUID != 0 )); then
-  # Running from a pipe  -  ask to re-exec with sudo
-  echo -e "${Y}This script needs root privileges.${N}"
-  echo -e "${Y}Please run: ${B}curl -fsSL <URL> | sudo bash${N}"
-  exit 0
-fi
-
-# Parse flags
-FLAG_HOSTEL=""
-FLAG_IP=""
-FLAG_NO_LAN_WATCH=false
-FLAG_UNINSTALL=false
-FLAG_DIAGNOSE=false
-FLAG_YES=false
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --hostel)      shift; FLAG_HOSTEL="$1" ;;
-    --ip)          shift; FLAG_IP="$1" ;;
-    --no-lan-watch) FLAG_NO_LAN_WATCH=true ;;
-    --uninstall)   FLAG_UNINSTALL=true ;;
-    --diagnose)    FLAG_DIAGNOSE=true ;;
-    --yes)         FLAG_YES=true ;;
-    *)             echo "Unknown flag: $1"; exit 1 ;;
-  esac
-  shift
-done
-
-if $FLAG_UNINSTALL; then
-  detect_distro
-  detect_iface
-  uninstall
-  exit 0
-fi
-if $FLAG_DIAGNOSE; then
-  detect_iface
-  diagnose
-  exit 0
-fi
-
-# Check if mihomo is already installed (systemd unit or binary exists)
-if command -v mihomo &>/dev/null || [[ -f /etc/mihomo/config.yaml ]]; then
-  show_menu
-else
-  main_install
+# Only run when executed directly  -  allows tests to source this file.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
 fi

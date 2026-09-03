@@ -1,10 +1,11 @@
+# mnnit-proxy mihomo config  -  rendered by install.sh/update.sh (do not edit placeholders by hand)
 mixed-port: 7890
 mode: rule
 log-level: info
 ipv6: false
 
 tun:
-  enable: true
+  enable: {{TUN_ENABLE}}
   stack: system
   auto-route: true
   auto-detect-interface: true

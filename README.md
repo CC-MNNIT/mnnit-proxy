@@ -1,5 +1,7 @@
 # mnnit-proxy
 
+[![tests](https://github.com/YOUR_USER/mnnit-proxy/actions/workflows/test.yml/badge.svg)](https://github.com/YOUR_USER/mnnit-proxy/actions/workflows/test.yml)
+
 System-wide college proxy for MNNIT Allahabad  -  works for ALL apps, no per-app setup.
 
 Powered by **mihomo** (TUN mode)  -  like Proxifier on Windows, but for Linux.  
@@ -77,6 +79,32 @@ If the installer doesn't work for your distro or network:
 ```bash
 sudo bash install.sh --uninstall
 ```
+
+## All flags (install.sh)
+
+| Flag | Behavior |
+|---|---|
+| `--hostel "Name" --ip IP --yes` | Fully unattended install (skips all prompts) |
+| `--force` | Proceed even if IP is outside the documented range |
+| `--gateway IP` | Override the derived gateway (e.g. SVBH floor-wise subnets) |
+| `--skip-ip` | Don't touch nmcli/network settings (CI, self-managed) |
+| `--no-tun` | Proxy port only, no TUN device (CI/VM friendly) |
+| `--no-lan-watch` | Don't install the LAN auto start/stop watcher |
+| `--uninstall` | Remove everything, restore DHCP |
+| `--diagnose` | Run diagnostics |
+
+`update.sh` actions: `--action change-ip --hostel N --ip IP --yes` · `--action dhcp` · `--action status` · `--action watch`
+
+## Tests
+
+```bash
+bash tests/unit-tests.sh          # syntax, shellcheck, function tests (no root)
+sudo bash tests/integration-test.sh   # full unattended install + proxy e2e (Debian/Ubuntu)
+bash tests/docker-ubuntu.sh       # same, inside a systemd-enabled Ubuntu container
+bash tests/run-tests.sh arch      # Arch binary-install path (root/container)
+```
+
+CI runs the same tests on every push: Ubuntu 22.04 + 24.04 (tinyproxy stands in for the college proxy with the same Basic-auth mechanics) plus an Arch container for the binary-install path.
 
 ## Structure
 

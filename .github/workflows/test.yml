@@ -1,0 +1,49 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Run unit tests
+        run: bash tests/unit-tests.sh "$GITHUB_WORKSPACE"
+
+  integration:
+    name: Integration (${{ matrix.os }})
+    needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run integration tests (tinyproxy stand-in + unattended install + dispatcher)
+        run: sudo bash tests/integration-test.sh "$GITHUB_WORKSPACE"
+
+  arch:
+    name: Arch binary-install path
+    needs: unit
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test deps
+        run: |
+          pacman -Syu --noconfirm --needed curl python systemd
+      - name: Run unit tests
+        run: bash tests/unit-tests.sh "$GITHUB_WORKSPACE"
+      - name: Run arch path tests (binary install + config gen)
+        run: bash tests/run-tests.sh arch
