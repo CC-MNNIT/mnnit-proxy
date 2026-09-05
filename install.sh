@@ -155,7 +155,7 @@ ensure_data() {
   if [[ -f "$TSV" && -f "$TEMPLATE" ]]; then
     return 0
   fi
-  local base="${REPO_RAW:-https://raw.githubusercontent.com/YOUR_USER/mnnit-proxy/main}"
+  local base="${REPO_RAW:-https://raw.githubusercontent.com/CC-MNNIT/mnnit-proxy/main}"
   TMPDIR_DATA="$(mktemp -d)"
   log "Running from a pipe  -  downloading data files..."
   download "$base/hostels.tsv" "$TMPDIR_DATA/hostels.tsv" \

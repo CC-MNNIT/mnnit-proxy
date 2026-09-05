@@ -1,6 +1,6 @@
 # mnnit-proxy
 
-[![tests](https://github.com/YOUR_USER/mnnit-proxy/actions/workflows/test.yml/badge.svg)](https://github.com/YOUR_USER/mnnit-proxy/actions/workflows/test.yml)
+[![tests](https://github.com/CC-MNNIT/mnnit-proxy/actions/workflows/test.yml/badge.svg)](https://github.com/CC-MNNIT/mnnit-proxy/actions/workflows/test.yml)
 
 System-wide college proxy for MNNIT Allahabad  -  works for ALL apps, no per-app setup.
 
@@ -11,13 +11,13 @@ Supports Arch and Ubuntu (x86_64 / arm64).
 
 ### On campus (LAN plugged in)
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USER/mnnit-proxy/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/CC-MNNIT/mnnit-proxy/main/install.sh | sudo bash
 ```
 
 If GitHub is blocked on campus, use the proxy to fetch the script:
 ```bash
 curl -x http://edcguest:edcguest@172.31.100.25:3128 -fsSL \
-  https://raw.githubusercontent.com/YOUR_USER/mnnit-proxy/main/install.sh | sudo bash
+  https://raw.githubusercontent.com/CC-MNNIT/mnnit-proxy/main/install.sh | sudo bash
 ```
 
 ### What happens
