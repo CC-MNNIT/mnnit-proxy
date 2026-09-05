@@ -17,7 +17,7 @@ readonly PROXY_PASS="edcguest"
 readonly DNS_SRV="172.31.100.6, 172.31.100.7, 172.31.100.8"
 readonly DNS_SRV_LIST="172.31.100.6,172.31.100.7,172.31.100.8"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || pwd)"
 if [[ -f "$SCRIPT_DIR/hostels.tsv" && -f "$SCRIPT_DIR/config.template.yaml" ]]; then
   TSV="$SCRIPT_DIR/hostels.tsv"
   TEMPLATE="$SCRIPT_DIR/config.template.yaml"
@@ -506,7 +506,7 @@ parse_flags() {
       --yes|-y)     FLAG_YES=true; shift ;;
       --force)      FLAG_FORCE=true; shift ;;
       --non-interactive) FLAG_YES=true; shift ;;
-      -h|--help)    sed -n '2,10p' "${BASH_SOURCE[0]}"; exit 0 ;;
+      -h|--help)    sed -n "2,10p" "${BASH_SOURCE[0]:-$0}"; exit 0 ;;
       *)            die "Unknown flag: $1" ;;
     esac
   done
@@ -515,7 +515,7 @@ parse_flags() {
 main() {
   parse_flags "$@"
   if [[ $EUID -ne 0 ]]; then
-    if [[ -r /dev/tty ]]; then
+    if [[ -n "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" != "-" && -f "${BASH_SOURCE[0]}" && -r /dev/tty ]]; then
       warn "This script needs root. Re-running with sudo..."
       exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
     fi
@@ -552,6 +552,6 @@ main() {
   esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "${0}" ]]; then
   main "$@"
 fi
