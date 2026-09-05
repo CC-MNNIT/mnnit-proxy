@@ -10,7 +10,7 @@
 #   sudo bash update.sh --action watch                     # toggle LAN watcher
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.1.1"
+readonly APP_VERSION="1.1.2"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
@@ -210,7 +210,7 @@ summary_edit_loop() {
       1)
         while :; do
           local ip
-          ip=$(ask "Enter the assigned IP" "$SELECTED_HOSTEL_IP")
+          ip=$(ask "Enter your room IP" "$SELECTED_HOSTEL_IP")
           if valid_ip "$ip"; then SELECTED_HOSTEL_IP="$ip"; break; fi
           warn "Not a valid IP address"
         done
@@ -286,11 +286,10 @@ pick_hostel() {
   echo ""
   echo -e "${B}${C}📄  Find your room's IP here (open on phone/PC):${N}"
   echo -e "${C}   $pdf${N}"
-  ask "Press Enter when you have it" ""
 
   while :; do
     local ip
-    ip=$(ask "Enter the assigned IP from the PDF" "")
+    ip=$(ask "Enter your room IP (from the PDF above)" "")
     if [[ -z "$ip" ]]; then warn "IP cannot be empty"; continue; fi
     if ! valid_ip "$ip"; then warn "Not a valid IP address"; continue; fi
     if in_range "$ip" "$ip_from" "$ip_to"; then

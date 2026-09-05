@@ -23,7 +23,7 @@ curl -x http://edcguest:edcguest@172.31.100.25:3128 -fsSL \
 ### What happens
 1. You pick your hostel from a list
 2. It prints the official PDF link with room-wise IPs  -  open it on your phone
-3. Enter your assigned IP → installer sets up everything
+3. Enter your room IP → installer sets up everything
 4. After success, every app on your laptop goes through the college proxy automatically
 
 ### After install
