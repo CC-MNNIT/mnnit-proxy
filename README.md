@@ -42,6 +42,8 @@ curl -x http://edcguest:edcguest@172.31.100.25:3128 -fsSL \
 
 Everything else (browsers, git, curl, npm, pip, SSH, apt, pacman, etc.) works in ALL apps.
 
+**Seeing a `Meta` network device?** That's normal - it's mihomo's TUN interface doing the proxying (same idea as tailscale0). Don't delete or edit it; it appears/disappears with the proxy.
+
 ## Hostel IP allotment PDFs
 
 | Hostel | PDF Link |

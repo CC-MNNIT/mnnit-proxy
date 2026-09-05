@@ -10,7 +10,7 @@
 #   sudo bash update.sh --action watch                     # toggle LAN watcher
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.1.0"
+readonly APP_VERSION="1.1.1"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
@@ -335,11 +335,12 @@ apply_ip() {
   local carrier
   carrier=$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null || echo 0)
   if [[ "$carrier" == "1" ]]; then
-    nmcli con down "$WIRED_CONN" 2>/dev/null || true
+    nmcli con down "$WIRED_CONN" 2>/dev/null >/dev/null || true
     nmcli con up "$WIRED_CONN" || warn "Connection activation failed"
     ok "Static IP applied"
   else
-    nmcli con up "$WIRED_CONN" 2>/dev/null || true
+    # No cable: never activate - avoids phantom "activated" state in NM.
+    nmcli con down "$WIRED_CONN" 2>/dev/null >/dev/null || true
     warn "Cable not plugged in  -  config saved; activates at hostel."
   fi
 }

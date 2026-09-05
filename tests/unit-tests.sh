@@ -92,6 +92,32 @@ derive_network
 t "--gateway overrides"        test "$SELECTED_HOSTEL_GW" = "172.31.137.1"
 unset FLAG_GATEWAY
 
+echo "── should_start_mihomo decision matrix ──"
+# Matrix: [watcher-installed?] x [campus-gateway-present?]
+# Watcher rule dominates: if the dispatcher file exists, NEVER start.
+DISP=/etc/NetworkManager/dispatcher.d/90-mihomo-lan
+if [[ -f "$DISP" ]]; then
+  tf "watcher present -> never force-start" should_start_mihomo
+  if [[ $EUID -eq 0 ]]; then
+    # root: can temporarily remove dispatcher to test the no-watcher branch
+    mv "$DISP" "$DISP.unittest"
+    if ip route show default 2>/dev/null | grep -q "via 172.31."; then
+      t "no watcher + campus link -> start" should_start_mihomo
+    else
+      tf "no watcher + no campus link -> don't start" should_start_mihomo
+    fi
+    mv "$DISP.unittest" "$DISP"
+  else
+    echo "  - watcher installed on this machine; no-watcher branch covered by CI"
+  fi
+else
+  if ip route show default 2>/dev/null | grep -q "via 172.31."; then
+    t "no watcher + campus link -> start" should_start_mihomo
+  else
+    tf "no watcher + no campus link -> don't start" should_start_mihomo
+  fi
+fi
+
 echo "── config rendering ──"
 # PROXY_PORT/PROXY_USER/PROXY_PASS are already set (readonly) by sourcing install.sh
 TEMPLATE="$REPO/config.template.yaml"

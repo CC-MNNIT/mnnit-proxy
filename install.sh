@@ -21,7 +21,7 @@
 #   --diagnose         run diagnostics
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.1.0"
+readonly APP_VERSION="1.1.1"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
@@ -272,9 +272,21 @@ install_mihomo_binary() {
     warn "GitHub API unavailable  -  using pinned release $tag"
   fi
   local url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/mihomo-linux-${arch}-${tag}.gz"
-  download "$url" "$tmpd/mihomo.gz" || die "Failed to download mihomo binary ($tag)"
-  gunzip -c "$tmpd/mihomo.gz" > /usr/local/bin/mihomo
-  chmod +x /usr/local/bin/mihomo
+  # Retry once - campus/container networks occasionally reset TLS mid-download.
+  local ok_dl=false attempt
+  for attempt in 1 2; do
+    rm -f "$tmpd/mihomo.gz"
+    if download "$url" "$tmpd/mihomo.gz" && [[ -s "$tmpd/mihomo.gz" ]]; then
+      ok_dl=true
+      break
+    fi
+    [[ "$attempt" == 1 ]] && warn "Download failed - retrying..."
+  done
+  [[ "$ok_dl" == true ]] || die "Failed to download mihomo binary ($tag)"
+  # Stage + validate BEFORE touching the final path (no 0-byte ghosts).
+  gunzip -c "$tmpd/mihomo.gz" > "$tmpd/mihomo.bin" 2>/dev/null \
+    || die "Downloaded file is not a valid gzip archive"
+  install -m 755 "$tmpd/mihomo.bin" /usr/local/bin/mihomo
   rm -rf "$tmpd"
   write_mihomo_unit "/usr/local/bin/mihomo"
   ok "mihomo installed to /usr/local/bin/mihomo"
@@ -641,11 +653,13 @@ apply_ip() {
   local carrier
   carrier=$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null || echo 0)
   if [[ "$carrier" == "1" ]]; then
-    nmcli con down "$WIRED_CONN" 2>/dev/null || true
+    nmcli con down "$WIRED_CONN" 2>/dev/null >/dev/null || true
     nmcli con up "$WIRED_CONN" || warn "Connection activation failed  -  check cable"
     ok "Static IP applied"
   else
-    nmcli con up "$WIRED_CONN" 2>/dev/null || true
+    # No cable: never activate - a phantom "activated" profile confuses NM
+    # (and the user). Config is saved; the dispatcher fires on plug-in.
+    nmcli con down "$WIRED_CONN" 2>/dev/null >/dev/null || true
     warn "Cable not plugged in  -  config saved; it activates when you plug in at hostel."
   fi
 }
@@ -676,6 +690,28 @@ install_watcher() {
   systemctl disable mihomo 2>/dev/null || true   # dispatcher owns start/stop now
   ok "LAN watcher installed  -  mihomo starts/stops automatically with campus LAN"
   echo -e "${Y}  ⓘ  Plug in at hostel → start. Unplug or go home → stop.${N}"
+}
+
+# Decide whether mihomo should be started right now.
+# Watcher installed -> never start here; the dispatcher fires on link events
+# (including apply_ip's con down/up on campus). Starting manually would
+# phantom-activate on hotspot.
+# No watcher -> start only if a campus (172.31.*) gateway exists.
+should_start_mihomo() {
+  if [[ -f /etc/NetworkManager/dispatcher.d/90-mihomo-lan ]]; then
+    return 1
+  fi
+  local d i gw
+  for d in /sys/class/net/*; do
+    i="${d##*/}"
+    [[ "$i" == "lo" ]] && continue
+    [[ "$i" == Meta* || "$i" == utun* || "$i" == tun* ]] && continue
+    gw=$(ip route show default dev "$i" 2>/dev/null | awk '{print $3; exit}')
+    if [[ "$gw" == 172.31.* ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # ---- verification ----
@@ -915,11 +951,13 @@ main_install() {
   gen_config
   install_watcher
 
-  # Start service: dispatcher mode keeps it disabled, direct mode enables at boot
-  if systemctl is-enabled mihomo 2>/dev/null | grep -q "^enabled$"; then
+  # Start service: watcher mode -> dispatcher owns lifecycle, never force-start
+  # (it would create a phantom active state on hotspot). No-watcher mode ->
+  # enable at boot and start only when actually on campus.
+  if should_start_mihomo; then
     systemctl enable --now mihomo 2>/dev/null || true
   else
-    systemctl start mihomo 2>/dev/null || true
+    echo -e "${Y}  ⓘ  mihomo left stopped - it starts automatically when you plug in at campus.${N}"
   fi
   verify
   self_install

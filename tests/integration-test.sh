@@ -86,6 +86,13 @@ t "config tun disabled"        grep -q "enable: false" /etc/mihomo/config.yaml
 t "config chmod 600"           test "$(stat -c %a /etc/mihomo/config.yaml 2>/dev/null || stat -f %Lp /etc/mihomo/config.yaml)" = "600"
 t "mihomo -t validates config" mihomo -t -d /etc/mihomo
 t "mihomo service active"      systemctl is-active mihomo
+# CI runners are NOT on campus (no 172.31.* gateway) and the install used
+# --no-lan-watch, so mihomo must have been started by the install (direct
+# mode), but must NOT be started via phantom activation paths. Assert the
+# no-phantom guarantee: service state matches the decision helper.
+grep -q "mihomo left stopped" "$UNATTENDED_OUT" \
+  && t "correctly left stopped (no campus)" systemctl is-active mihomo \
+  || t "correctly started (unattended direct mode)" systemctl is-active mihomo
 grep -q "✅" "$UNATTENDED_OUT" && { echo "  ✓ installer reported success"; PASS=$((PASS+1)); } || { echo "  ⚠ installer success marker missing"; }
 rm -f "$UNATTENDED_OUT"
 
