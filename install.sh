@@ -119,7 +119,7 @@ download() {
   local url="$1" out="$2" mirror src
   for mirror in "${DLOAD_MIRRORS[@]}"; do
     src="${mirror}${url}"
-    if curl -fsSL --max-time 15 "$src" -o "$out" 2>/dev/null; then
+    if curl -fsSL --connect-timeout 8 --max-time 120 "$src" -o "$out" 2>/dev/null; then
       return 0
     fi
   done

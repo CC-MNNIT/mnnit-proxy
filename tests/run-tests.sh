@@ -65,7 +65,11 @@ download() {
 rm -f /usr/local/bin/mihomo
 install_mihomo_binary
 t "binary installed despite API failure" test -x /usr/local/bin/mihomo
-t "pinned version used"  /usr/local/bin/mihomo -v | grep -q "$MIHOMO_PINNED"
+V=$(/usr/local/bin/mihomo -v 2>/dev/null | head -1 || true)
+case "$V" in
+  *"$MIHOMO_PINNED"*) echo "  ✓ pinned version used ($V)"; PASS=$((PASS+1)) ;;
+  *) echo "  ✗ pinned version used (got: ${V:-none})"; FAIL=$((FAIL+1)) ;;
+esac
 echo "ARCH-PASS=$PASS ARCH-FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
 exit $(( FAIL > 0 ? 1 : 0 ))
