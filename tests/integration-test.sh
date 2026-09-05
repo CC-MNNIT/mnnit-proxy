@@ -62,10 +62,21 @@ Allow 127.0.0.1
 BasicAuth edcguest edcguest
 EOF
 systemctl restart tinyproxy 2>/dev/null || service tinyproxy restart 2>/dev/null || tinyproxy -c "$TP_CONF" &
-sleep 1
+# Wait for the port (service restart can race the test)
+for _ in 1 2 3 4 5 6 7 8; do
+  bash -c 'echo > /dev/tcp/127.0.0.1/3128' 2>/dev/null && break
+  sleep 1
+done
 t "tinyproxy listens on 127.0.0.1:3128" bash -c 'echo > /dev/tcp/127.0.0.1/3128'
-# Direct proxy test with auth (bypasses mihomo entirely)
-t "tinyproxy honors BasicAuth" curl -fsS --max-time 10 -x http://edcguest:edcguest@127.0.0.1:3128 -o /dev/null https://api.github.com
+# Direct proxy test with auth (bypasses mihomo entirely); retry for flake-resistance
+AUTH_OK=false
+for _ in 1 2 3; do
+  if curl -fsS --max-time 10 -x http://edcguest:edcguest@127.0.0.1:3128 -o /dev/null https://api.github.com 2>/dev/null; then
+    AUTH_OK=true; break
+  fi
+  sleep 2
+done
+$AUTH_OK && { echo "  ✓ tinyproxy honors BasicAuth"; PASS=$((PASS+1)); } || { echo "  ✗ tinyproxy honors BasicAuth"; FAIL=$((FAIL+1)); }
 
 echo "── install.sh unattended install ──"
 UNATTENDED_OUT=$(mktemp)
@@ -85,14 +96,13 @@ t "config has college proxy"   grep -q "server: 172.31.100.27" /etc/mihomo/confi
 t "config tun disabled"        grep -q "enable: false" /etc/mihomo/config.yaml
 t "config chmod 600"           test "$(stat -c %a /etc/mihomo/config.yaml 2>/dev/null || stat -f %Lp /etc/mihomo/config.yaml)" = "600"
 t "mihomo -t validates config" mihomo -t -d /etc/mihomo
-t "mihomo service active"      systemctl is-active mihomo
-# CI runners are NOT on campus (no 172.31.* gateway) and the install used
-# --no-lan-watch, so mihomo must have been started by the install (direct
-# mode), but must NOT be started via phantom activation paths. Assert the
-# no-phantom guarantee: service state matches the decision helper.
-grep -q "mihomo left stopped" "$UNATTENDED_OUT" \
-  && t "correctly left stopped (no campus)" systemctl is-active mihomo \
-  || t "correctly started (unattended direct mode)" systemctl is-active mihomo
+# Start decision: runners have no campus gateway, so the installer should
+# leave mihomo stopped (correct no-phantom behavior). Assert the right one.
+if grep -q "mihomo left stopped" "$UNATTENDED_OUT"; then
+  tf "correctly left stopped (no campus network)" systemctl is-active mihomo
+else
+  t "correctly started (campus detected)" systemctl is-active mihomo
+fi
 grep -q "✅" "$UNATTENDED_OUT" && { echo "  ✓ installer reported success"; PASS=$((PASS+1)); } || { echo "  ⚠ installer success marker missing"; }
 rm -f "$UNATTENDED_OUT"
 
