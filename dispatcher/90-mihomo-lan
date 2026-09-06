@@ -22,7 +22,9 @@ campus_link() {
 }
 
 case "$ACTION" in
-  up)
+  up|connectivity-change|dhcp4-change)
+    # connectivity-change/dhcp4-change fire without a link down/up - the
+    # campus_link check handles both directions safely (idempotent).
     if campus_link; then
       if systemctl is-active --quiet mihomo 2>/dev/null; then
         exit 0  # already running - no duplicate starts/log noise

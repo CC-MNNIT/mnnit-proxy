@@ -8,9 +8,16 @@
 #   sudo bash update.sh --action dhcp                      # restore DHCP + stop
 #   sudo bash update.sh --action status
 #   sudo bash update.sh --action watch                     # toggle LAN watcher
+#
+# Flags:
+#   --hostel NAME      hostel name (exact or unique substring)
+#   --ip IP            your room IP from the hostel PDF
+#   --gateway IP       override the derived gateway
+#   --force            proceed even if IP is outside the documented range
+#   --yes|-y           accept prompts (unattended)
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.1.2"
+readonly APP_VERSION="1.2.0"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
@@ -32,6 +39,7 @@ fi
 
 WIRED_IFACE=""
 WIRED_CONN=""
+NET_BACKEND=""   # networkmanager | netplan | manual
 SELECTED_HOSTEL_NAME=""
 SELECTED_HOSTEL_IP=""
 SELECTED_HOSTEL_GW=""
@@ -80,14 +88,129 @@ confirm() {
 ip2int() {
   local IFS=. a b c d
   read -r a b c d <<< "$1"
-  echo "$((a<<24 | b<<16 | c<<8 | d))"
+  echo "$((10#$a<<24 | 10#$b<<16 | 10#$c<<8 | 10#$d))"
 }
 in_range() {
   local ip_i from_i to_i
   ip_i=$(ip2int "$1"); from_i=$(ip2int "$2"); to_i=$(ip2int "$3")
   ((ip_i >= from_i && ip_i <= to_i))
 }
-valid_ip() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+# Strict: four dot-separated octets, each 0-255 (leading zeros parsed base-10).
+valid_ip() {
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o
+  for o in "${BASH_REMATCH[@]:1}"; do
+    (( 10#$o <= 255 )) || return 1
+  done
+  return 0
+}
+
+# ---- backend classification (same rules as install.sh) ----
+detect_backend() {
+  NET_BACKEND="${MNNIT_FORCE_BACKEND:-}"
+  [[ -n "$NET_BACKEND" ]] && return 0   # test seam
+  if command -v nmcli &>/dev/null && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    NET_BACKEND="networkmanager"
+  elif command -v netplan &>/dev/null && [[ -d "${NETPLAN_DIR:-/etc/netplan}" ]]; then
+    NET_BACKEND="netplan"
+  else
+    NET_BACKEND="manual"
+  fi
+}
+
+NETPLAN_FILE="/etc/netplan/99-mnnit-proxy.yaml"
+
+netplan_yaml() {
+  cat <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $WIRED_IFACE:
+      dhcp4: no
+      addresses: [$SELECTED_HOSTEL_IP/$SELECTED_HOSTEL_PREFIX]
+      routes:
+        - to: default
+          via: $SELECTED_HOSTEL_GW
+      nameservers:
+        addresses: [${DNS_SRV_LIST//,/ }]
+EOF
+}
+
+# Scan the directory of NETPLAN_FILE (same base dir in prod and tests).
+netplan_iface_conflicts() {
+  local base_dir
+  base_dir="$(dirname "$NETPLAN_FILE")"
+  grep -rlE "(^|[^-[:alnum:]])$WIRED_IFACE:" "$base_dir"/*.yaml 2>/dev/null | head -1
+}
+
+print_manual_ip_instructions() {
+  cat <<EOF
+
+  No NetworkManager or netplan found  -  set your static IP manually.
+  Paste this whole block into a terminal (values are filled in for you):
+
+  ┌────────────── COPY FROM HERE ──────────────
+  │ sudo tee /etc/netplan/99-mnnit-proxy.yaml >/dev/null <<'NETPLAN'
+  │ network:
+  │   version: 2
+  │   renderer: networkd
+  │   ethernets:
+  │     $WIRED_IFACE:
+  │       dhcp4: no
+  │       addresses: [$SELECTED_HOSTEL_IP/$SELECTED_HOSTEL_PREFIX]
+  │       routes:
+  │         - to: default
+  │           via: $SELECTED_HOSTEL_GW
+  │       nameservers:
+  │         addresses: [${DNS_SRV_LIST//,/ }]
+  │ NETPLAN
+  │ sudo chmod 600 /etc/netplan/99-mnnit-proxy.yaml
+  │ sudo netplan apply
+  └────────────── COPY TO HERE ───────────────
+
+  Then verify with:  ip -4 addr show $WIRED_IFACE
+EOF
+}
+
+apply_netplan() {
+  log "Applying static IP via netplan..."
+  local conflict
+  conflict=$(netplan_iface_conflicts || true)
+  if [[ -n "$conflict" ]]; then
+    warn "Existing netplan file already configures $WIRED_IFACE: $(basename "$conflict")"
+    warn "Not touching it  -  add these values there manually:"
+    netplan_yaml | sed 's/^/    /'
+    return 0
+  fi
+  netplan_yaml > "$NETPLAN_FILE.tmp"
+  mv "$NETPLAN_FILE.tmp" "$NETPLAN_FILE"
+  chmod 600 "$NETPLAN_FILE"
+  if netplan apply 2>/dev/null; then
+    sleep 2
+    if ip -4 addr show "$WIRED_IFACE" 2>/dev/null | grep -q "$SELECTED_HOSTEL_IP/"; then
+      ok "Static IP applied via netplan ($NETPLAN_FILE)"
+      return 0
+    fi
+    warn "netplan apply ran but the IP is not on $WIRED_IFACE yet"
+    return 0
+  fi
+  rm -f "$NETPLAN_FILE"
+  warn "netplan apply failed  -  our config was rolled back. Instructions:"
+  print_manual_ip_instructions
+}
+
+# ---- preflight (updater needs less, but fail clearly) ----
+preflight() {
+  local missing=() cmd
+  for cmd in python3 ip mihomo; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    die "Missing required tools: ${missing[*]}  -  is mnnit-proxy fully installed?"
+  fi
+  detect_backend
+}
 
 detect_iface() {
   local -a ifaces=()
@@ -108,10 +231,27 @@ detect_iface() {
   done
   iface="${iface:-${ifaces[0]}}"
   WIRED_IFACE="$iface"
-  if command -v nmcli &>/dev/null; then
-    WIRED_CONN=$(nmcli -g GENERAL.CONNECTION device show "$WIRED_IFACE" 2>/dev/null | head -1 || true)
-    if [[ -z "$WIRED_CONN" ]]; then
-      WIRED_CONN=$(nmcli -t -f NAME,TYPE con show 2>/dev/null | grep ':802-3-ethernet' | cut -d: -f1 | head -1 || true)
+  if [[ "$NET_BACKEND" == "netplan" || "$NET_BACKEND" == "manual" ]]; then
+    ok "Interface: $WIRED_IFACE (backend: $NET_BACKEND)"
+    WIRED_CONN=""
+    return 0
+  fi
+  WIRED_CONN=$(nmcli -g GENERAL.CONNECTION device show "$WIRED_IFACE" 2>/dev/null | head -1 || true)
+  if [[ -z "$WIRED_CONN" ]]; then
+    WIRED_CONN=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep ":$WIRED_IFACE\$" | cut -d: -f1 | head -1 || true)
+  fi
+  if [[ -z "$WIRED_CONN" ]]; then
+    local state
+    state=$(nmcli -g GENERAL.STATE device show "$WIRED_IFACE" 2>/dev/null || true)
+    if [[ "$state" == *unmanaged* ]]; then
+      warn "Interface $WIRED_IFACE is unmanaged by NetworkManager  -  netplan controls it."
+      NET_BACKEND="netplan"
+      WIRED_CONN=""
+      return 0
+    fi
+    if nmcli con add type ethernet ifname "$WIRED_IFACE" con-name "mnnit-wired" &>/dev/null; then
+      WIRED_CONN="mnnit-wired"
+      ok "Created NM profile 'mnnit-wired'"
     fi
   fi
   ok "Interface: $WIRED_IFACE (connection: ${WIRED_CONN:-none})"
@@ -321,8 +461,17 @@ pick_hostel() {
 }
 
 apply_ip() {
+  if [[ "$NET_BACKEND" == "netplan" ]]; then
+    apply_netplan
+    return 0
+  fi
+  if [[ "$NET_BACKEND" == "manual" ]]; then
+    print_manual_ip_instructions
+    return 0
+  fi
   if [[ -z "$WIRED_CONN" ]]; then
-    warn "No NetworkManager connection profile  -  set the IP manually."
+    warn "No NetworkManager connection profile  -  set the IP manually:"
+    warn "  nmcli con mod <name> ipv4.method manual ipv4.addresses ${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX} ipv4.gateway ${SELECTED_HOSTEL_GW} ipv4.dns \"${DNS_SRV_LIST}\""
     return 0
   fi
   log "Applying static IP on '$WIRED_CONN'..."
@@ -380,7 +529,9 @@ t = t.replace("{{TUN_ENABLE}}", tun_enable)
 sys.stdout.write(t)
 PYEOF
   ) || die "Failed to render config"
-  printf '%s\n' "$rendered" > /etc/mihomo/config.yaml
+  # Atomic write - an interrupted redirect would leave a truncated config
+  printf '%s\n' "$rendered" > /etc/mihomo/config.yaml.tmp
+  mv /etc/mihomo/config.yaml.tmp /etc/mihomo/config.yaml
   chmod 600 /etc/mihomo/config.yaml
   mihomo -t -d /etc/mihomo >/dev/null 2>&1 || {
     mihomo -t -d /etc/mihomo 2>&1 || true
@@ -429,6 +580,11 @@ restore_dhcp() {
     nmcli con mod "$WIRED_CONN" ipv4.method auto ipv4.addresses "" ipv4.gateway "" 2>/dev/null || true
     nmcli con up "$WIRED_CONN" 2>/dev/null || true
     ok "DHCP restored"
+  elif [[ -f "$NETPLAN_FILE" ]]; then
+    # We wrote a netplan file - remove it and let the existing config take over
+    rm -f "$NETPLAN_FILE"
+    netplan apply 2>/dev/null || true
+    ok "DHCP restored (netplan static IP removed)"
   else
     warn "No connection profile found  -  set DHCP manually if needed."
   fi
@@ -439,6 +595,10 @@ restore_dhcp() {
 
 toggle_watcher() {
   local file=/etc/NetworkManager/dispatcher.d/90-mihomo-lan
+  if [[ "$NET_BACKEND" != "networkmanager" ]]; then
+    warn "LAN watcher needs NetworkManager, which is not active on this system."
+    return 0
+  fi
   if [[ -f "$file" ]]; then
     if confirm "LAN watcher is INSTALLED. Remove it?" "n"; then
       rm -f "$file"
@@ -512,6 +672,22 @@ parse_flags() {
   done
 }
 
+# Shared by change-ip action and the flag-driven default path.
+unattended_change() {
+  if ! valid_ip "$FLAG_IP"; then
+    die "Invalid --ip '$FLAG_IP'  -  expected four dot-separated octets, e.g. 172.31.64.135"
+  fi
+  if [[ -n "$FLAG_GATEWAY" ]] && ! valid_ip "$FLAG_GATEWAY"; then
+    die "Invalid --gateway '$FLAG_GATEWAY'"
+  fi
+  SELECTED_HOSTEL_IP="$FLAG_IP"
+  if ! resolve_hostel_by_name "$FLAG_HOSTEL"; then exit 1; fi
+  derive_network
+  apply_ip
+  gen_config
+  ok "Done. Configured for $SELECTED_HOSTEL_NAME."
+}
+
 main() {
   parse_flags "$@"
   if [[ $EUID -ne 0 ]]; then
@@ -521,29 +697,20 @@ main() {
     fi
     die "This script needs root. Run with sudo."
   fi
+  preflight
   case "$ACTION" in
     change-ip)
       if [[ -z "$FLAG_HOSTEL" || -z "$FLAG_IP" ]]; then
         die "--action change-ip needs --hostel and --ip"
       fi
-      SELECTED_HOSTEL_IP="$FLAG_IP"
-      if ! resolve_hostel_by_name "$FLAG_HOSTEL"; then exit 1; fi
-      derive_network
-      apply_ip
-      gen_config
-      ok "Done. Configured for $SELECTED_HOSTEL_NAME."
+      unattended_change
       ;;
     dhcp)  restore_dhcp ;;
     status) show_status ;;
     watch) toggle_watcher ;;
     "")
       if [[ "$FLAG_YES" == true && -n "$FLAG_HOSTEL" && -n "$FLAG_IP" ]]; then
-        SELECTED_HOSTEL_IP="$FLAG_IP"
-        if ! resolve_hostel_by_name "$FLAG_HOSTEL"; then exit 1; fi
-        derive_network
-        apply_ip
-        gen_config
-        ok "Done. Configured for $SELECTED_HOSTEL_NAME."
+        unattended_change
       else
         menu
       fi

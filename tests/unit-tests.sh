@@ -59,13 +59,64 @@ echo "── ip helpers ──"
 t "ip2int correct"             test "$(ip2int 172.31.64.135)" = "$(( (172<<24)|(31<<16)|(64<<8)|135 ))"
 t "ip2int zero"                test "$(ip2int 0.0.0.0)" = 0
 t "ip2int max"                 test "$(ip2int 255.255.255.255)" = 4294967295
+t "ip2int no octal parsing"    test "$(ip2int 10.0.0.10)" = "$(( (10<<24)|10 ))"
 t "in_range middle of range"   in_range 172.31.64.135 172.31.64.60 172.31.65.168
 t "in_range at from edge"      in_range 172.31.64.60 172.31.64.60 172.31.65.168
 t "in_range at to edge"        in_range 172.31.65.168 172.31.64.60 172.31.65.168
 tf "in_range below range"      in_range 172.31.64.20 172.31.64.60 172.31.65.168
 tf "in_range above range"      in_range 172.31.66.1 172.31.64.60 172.31.65.168
 t "valid_ip accepts quad"      valid_ip 10.0.0.1
+t "valid_ip accepts 255"       valid_ip 255.255.255.255
 tf "valid_ip rejects garbage"  valid_ip not-an-ip
+tf "valid_ip rejects 999"      valid_ip 999.1.1.1
+tf "valid_ip rejects 256"      valid_ip 172.31.64.256
+tf "valid_ip rejects short"    valid_ip 1.2.3
+tf "valid_ip rejects 5 octets" valid_ip 1.2.3.4.5
+
+echo "── network backend classification ──"
+MOCKBIN="$(mktemp -d)"
+printf '#!/bin/sh\nexit 0\n' > "$MOCKBIN/systemctl"; chmod +x "$MOCKBIN/systemctl"
+# Strict isolation: PATH contains ONLY the mock dir, so the runner's real
+# nmcli/netplan can't leak in.
+OLD_PATH="$PATH"
+
+# networkmanager: nmcli present + NM active (mocked)
+printf '#!/bin/sh\nexit 0\n' > "$MOCKBIN/nmcli"; chmod +x "$MOCKBIN/nmcli"
+PATH="$MOCKBIN" detect_backend
+t "backend: networkmanager (mocked)"  test "$NET_BACKEND" = "networkmanager"
+
+# netplan: no nmcli, netplan + config dir present (mocked dir)
+rm -f "$MOCKBIN/nmcli"
+mkdir -p "$MOCKBIN/netplan-dir"
+printf '#!/bin/sh\nexit 0\n' > "$MOCKBIN/netplan"; chmod +x "$MOCKBIN/netplan"
+NETPLAN_DIR="$MOCKBIN/netplan-dir" PATH="$MOCKBIN" detect_backend
+t "backend: netplan (mocked)"         test "$NET_BACKEND" = "netplan"
+
+# manual: neither nmcli nor netplan on PATH
+rm -f "$MOCKBIN/netplan"
+PATH="$MOCKBIN" detect_backend
+t "backend: manual (mocked)"          test "$NET_BACKEND" = "manual"
+
+PATH="$OLD_PATH"
+rm -rf "$MOCKBIN"
+
+echo "── netplan config writer ──"
+WIRED_IFACE="enp0s8"
+SELECTED_HOSTEL_IP="172.31.64.135"
+SELECTED_HOSTEL_PREFIX="23"
+SELECTED_HOSTEL_GW="172.31.64.1"
+NP_DIR="$(mktemp -d)"
+netplan_yaml > "$NP_DIR/99-mnnit-proxy.yaml"
+t "netplan yaml has iface"        grep -q "^    enp0s8:" "$NP_DIR/99-mnnit-proxy.yaml"
+t "netplan yaml has ip/prefix"    grep -q "172.31.64.135/23" "$NP_DIR/99-mnnit-proxy.yaml"
+t "netplan yaml has gateway"      grep -q "via: 172.31.64.1" "$NP_DIR/99-mnnit-proxy.yaml"
+t "netplan yaml has all dns"      grep -q "172.31.100.6 172.31.100.7 172.31.100.8" "$NP_DIR/99-mnnit-proxy.yaml"
+tf "netplan yaml no placeholders" grep -q '{{' "$NP_DIR/99-mnnit-proxy.yaml"
+rm -rf "$NP_DIR"
+
+echo "── --help completeness ──"
+t "install.sh --help shows last flag (--diagnose)"  bash -c "bash '$REPO/install.sh' --help | grep -q -- '--diagnose'"
+t "update.sh --help shows last flag (--yes)"        bash -c "bash '$REPO/update.sh' --help | grep -q -- '--yes'"
 
 echo "── hostel resolution ──"
 TSV="$REPO/hostels.tsv"

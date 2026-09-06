@@ -170,6 +170,82 @@ t "change-ip regenerates"    bash "$REPO/update.sh" --action change-ip \
 t "config now has PG proxy"  grep -q "server: 172.31.100.25" /etc/mihomo/config.yaml
 t "mihomo still active"      systemctl is-active mihomo
 
+echo "── no-NM honest install path (backend forced to manual) ──"
+# Proves: install succeeds without NM, no dead dispatcher file is installed,
+# mihomo gets enabled for boot start, and the user is told the truth.
+NM_OUT=$(mktemp)
+MNNIT_FORCE_BACKEND=manual bash "$REPO/install.sh" \
+     --hostel "New Boys Hostel A Block" \
+     --ip 172.31.64.135 \
+     --yes --skip-ip --no-tun \
+     >"$NM_OUT" 2>&1
+t "install exits 0 without NetworkManager" test -f /etc/mihomo/config.yaml
+grep -q "NetworkManager not found" "$NM_OUT" && { echo "  ✓ reports NM missing honestly"; PASS=$((PASS+1)); } || { echo "  ✗ no NM-missing warning"; FAIL=$((FAIL+1)); }
+grep -q "LAN watcher unavailable" "$NM_OUT" && { echo "  ✓ watcher skipped with reason"; PASS=$((PASS+1)); } || { echo "  ✗ watcher guard message missing"; FAIL=$((FAIL+1)); }
+tf "no dead dispatcher file installed"      test -f /etc/NetworkManager/dispatcher.d/90-mihomo-lan
+t "mihomo enabled for boot start"           systemctl is-enabled mihomo
+rm -f "$NM_OUT"
+
+echo "── netplan path (backend forced, mocked apply) ──"
+# Fake netplan on PATH: records the apply call, never touches networking.
+NPBIN=$(mktemp -d)
+cat > "$NPBIN/netplan" <<'MOCK'
+#!/bin/bash
+if [[ "$1" == "apply" ]]; then touch /tmp/mnnit-test-netplan-applied; fi
+exit 0
+MOCK
+chmod +x "$NPBIN/netplan"
+mkdir -p "$NPBIN/netplan-dir"
+cat > "$NPBIN/ip" <<'MOCK'
+#!/bin/bash
+echo "inet 172.31.64.135/23"
+exit 0
+MOCK
+chmod +x "$NPBIN/ip"
+NP_OUT=$(mktemp)
+rm -f /tmp/mnnit-test-netplan-applied
+MNNIT_FORCE_BACKEND=netplan NETPLAN_DIR="$NPBIN/netplan-dir" PATH="$NPBIN:$PATH" \
+  bash "$REPO/install.sh" \
+     --hostel "New Boys Hostel A Block" \
+     --ip 172.31.64.135 \
+     --yes --skip-ip --no-tun --no-lan-watch \
+     >"$NP_OUT" 2>&1
+grep -q "Network backend: netplan" "$NP_OUT" && { echo "  ✓ backend detected as netplan"; PASS=$((PASS+1)); } || { echo "  ✗ netplan backend not detected"; FAIL=$((FAIL+1)); }
+# --skip-ip keeps install hands-off; exercise the writer directly
+NETPLAN_DIR="$NPBIN/netplan-dir" PATH="$NPBIN:$PATH" bash -c "
+  source '$REPO/install.sh' 2>/dev/null
+  WIRED_IFACE=entest0
+  SELECTED_HOSTEL_IP=172.31.64.135
+  SELECTED_HOSTEL_PREFIX=23
+  SELECTED_HOSTEL_GW=172.31.64.1
+  NETPLAN_FILE='$NPBIN/netplan-dir/99-mnnit-proxy.yaml'
+  apply_netplan >/dev/null 2>&1
+" && { echo "  ✓ netplan writer ran"; PASS=$((PASS+1)); } || { echo "  ✗ netplan writer failed"; FAIL=$((FAIL+1)); }
+t "netplan file written"                    test -f "$NPBIN/netplan-dir/99-mnnit-proxy.yaml"
+t "netplan file chmod 600"                  test "$(stat -c %a "$NPBIN/netplan-dir/99-mnnit-proxy.yaml" 2>/dev/null)" = "600"
+grep -q "172.31.64.135/23" "$NPBIN/netplan-dir/99-mnnit-proxy.yaml" 2>/dev/null && { echo "  ✓ netplan yaml has room IP"; PASS=$((PASS+1)); } || { echo "  ✗ netplan yaml missing room IP"; FAIL=$((FAIL+1)); }
+t "netplan apply was invoked"               test -f /tmp/mnnit-test-netplan-applied
+# conflict guard: pre-existing file managing the iface -> no overwrite
+touch "$NPBIN/netplan-dir/00-existing.yaml"
+echo "ethernets: {entest0: {dhcp4: true}}" > "$NPBIN/netplan-dir/00-existing.yaml"
+rm -f "$NPBIN/netplan-dir/99-mnnit-proxy.yaml" /tmp/mnnit-test-netplan-applied
+NETPLAN_DIR="$NPBIN/netplan-dir" PATH="$NPBIN:$PATH" bash -c "
+  source '$REPO/install.sh' 2>/dev/null
+  WIRED_IFACE=entest0
+  SELECTED_HOSTEL_IP=172.31.64.135
+  SELECTED_HOSTEL_PREFIX=23
+  SELECTED_HOSTEL_GW=172.31.64.1
+  NETPLAN_FILE='$NPBIN/netplan-dir/99-mnnit-proxy.yaml'
+  apply_netplan >/dev/null 2>&1
+"
+tf "conflict: our file NOT written"         test -f "$NPBIN/netplan-dir/99-mnnit-proxy.yaml"
+rm -rf "$NPBIN" "$NP_OUT"; rm -f /tmp/mnnit-test-netplan-applied
+
+echo "── unattended flag validation ──"
+t "invalid --ip rejected cleanly"   bash -c "bash '$REPO/install.sh' --hostel 'New Boys Hostel A Block' --ip not-an-ip --yes 2>&1 | grep -q 'Invalid --ip'"
+t "invalid --gateway rejected"      bash -c "bash '$REPO/install.sh' --hostel 'New Boys Hostel A Block' --ip 172.31.64.135 --gateway 999.1.1.1 --yes 2>&1 | grep -q 'Invalid --gateway'"
+t "999 octet rejected by updater"   bash -c "bash '$REPO/update.sh' --action change-ip --hostel 'Post Graduate Hostel' --ip 172.31.144.999 --yes 2>&1 | grep -q 'Invalid --ip'"
+
 echo
 if [[ $FAIL -eq 0 ]]; then
   echo "INTEGRATION: ALL $PASS TESTS PASSED"

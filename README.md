@@ -76,6 +76,23 @@ If the installer doesn't work for your distro or network:
 3. Set static IP via nmcli (see `hostels.tsv` for your hostel's gateway/subnet)
 4. `sudo systemctl enable --now mihomo`
 
+## Troubleshooting
+
+Run `sudo bash install.sh --diagnose` first  -  it prints service state, config validity, interface/gateway info and per-proxy reachability.
+
+**"No NetworkManager connection profile found"**
+NetworkManager has no ethernet profile (common on fresh Ubuntu where the cable was never plugged in). Plug the cable in and re-run the installer  -  since v1.2.0 it creates a `mnnit-wired` profile automatically.
+
+**"NetworkManager not found" (Ubuntu Server / minimal)**
+The installer checks your network backend up front:
+- NetworkManager active → full auto (static IP + LAN watcher)
+- netplan present (no NM) → it writes `/etc/netplan/99-mnnit-proxy.yaml` with your room IP, applies it and verifies. The LAN watcher is unavailable (it depends on NM), so mihomo auto-starts at boot instead  -  stop it off-campus with `sudo systemctl stop mihomo`
+- neither → it prints a complete copy-paste block with your values filled in
+
+If an existing netplan file already manages your interface, the installer never touches it  -  it prints the values to add manually instead.
+
+**Missing requirements** (curl/python3/iproute2/systemd) are checked before anything else and the installer exits with the exact install command for your distro.
+
 ## Uninstall
 
 ```bash

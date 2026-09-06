@@ -21,7 +21,7 @@
 #   --diagnose         run diagnostics
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.1.2"
+readonly APP_VERSION="1.2.0"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
@@ -34,9 +34,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || pwd)"
 TSV="$SCRIPT_DIR/hostels.tsv"
 TEMPLATE="$SCRIPT_DIR/config.template.yaml"
 DISPATCHER="$SCRIPT_DIR/dispatcher/90-mihomo-lan"
+UPDATE_SH=""   # set by ensure_data in pipe mode (self_install copies it)
 
 WIRED_IFACE=""
 WIRED_CONN=""
+NET_BACKEND=""   # networkmanager | netplan | manual
 SELECTED_HOSTEL_NAME=""
 SELECTED_HOSTEL_IP=""
 SELECTED_HOSTEL_GW=""
@@ -99,7 +101,7 @@ confirm() {
 ip2int() {
   local IFS=. a b c d
   read -r a b c d <<< "$1"
-  echo "$((a<<24 | b<<16 | c<<8 | d))"
+  echo "$((10#$a<<24 | 10#$b<<16 | 10#$c<<8 | 10#$d))"
 }
 
 in_range() {
@@ -110,7 +112,15 @@ in_range() {
   ((ip_i >= from_i && ip_i <= to_i))
 }
 
-valid_ip() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+# Strict: four dot-separated octets, each 0-255 (leading zeros allowed, parsed base-10).
+valid_ip() {
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o
+  for o in "${BASH_REMATCH[@]:1}"; do
+    (( 10#$o <= 255 )) || return 1
+  done
+  return 0
+}
 
 # ---- download with mirror chain ----
 DLOAD_MIRRORS=("" "https://ghfast.top/" "https://gh-proxy.com/" "https://mirror.ghproxy.com/")
@@ -168,6 +178,13 @@ ensure_data() {
   TEMPLATE="$TMPDIR_DATA/config.template.yaml"
   DISPATCHER="$TMPDIR_DATA/90-mihomo-lan"
   chmod 755 "$DISPATCHER" 2>/dev/null || true
+  # update.sh too, so offline 'mnnit-proxy-update' works for pipe installs
+  UPDATE_SH=""
+  if download "$base/update.sh" "$TMPDIR_DATA/update.sh"; then
+    UPDATE_SH="$TMPDIR_DATA/update.sh"
+  else
+    warn "Could not download update.sh  -  'mnnit-proxy-update' will need a reinstall"
+  fi
 }
 
 # ---- distro ----
@@ -185,6 +202,44 @@ detect_distro() {
     *)                                        DISTRO="$id"; DISTRO_FAMILY="other" ;;
   esac
   log "Detected: $DISTRO ($DISTRO_FAMILY)"
+}
+
+# ---- network backend classification ----
+# networkmanager  -  NM running, we manage IP + watcher
+# netplan         -  no NM, but netplan exists (Ubuntu Server default)
+# manual          -  neither: print copy-paste instructions, boot-start mihomo
+detect_backend() {
+  NET_BACKEND="${MNNIT_FORCE_BACKEND:-}"
+  [[ -n "$NET_BACKEND" ]] && return 0   # test seam
+  if command -v nmcli &>/dev/null && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    NET_BACKEND="networkmanager"
+  elif command -v netplan &>/dev/null && [[ -d "${NETPLAN_DIR:-/etc/netplan}" ]]; then
+    NET_BACKEND="netplan"
+  else
+    NET_BACKEND="manual"
+  fi
+}
+
+# ---- preflight: fail fast with actionable output, before any questions ----
+preflight() {
+  log "Checking system requirements..."
+  local missing=() cmd
+  for cmd in curl python3 ip systemctl; do
+    command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    fail "Missing required tools: ${missing[*]}"
+    local hint
+    case "$DISTRO_FAMILY" in
+      arch)   hint="sudo pacman -S curl python iproute2 systemd" ;;
+      debian) hint="sudo apt install curl python3 iproute2" ;;
+      *)      hint="install curl, python3 and iproute2 with your package manager" ;;
+    esac
+    die "Install them first, then re-run:  $hint"
+  fi
+  ok "Requirements OK"
+  detect_backend
+  log "Network backend: $NET_BACKEND"
 }
 
 # ---- mihomo install ----
@@ -241,7 +296,21 @@ install_mihomo_arch() {
   fi
   local helper="paru"
   command -v paru &>/dev/null || helper="yay"
-  if ! "$helper" -S --needed --noconfirm mihomo; then
+  # paru/yay refuse to run as root  -  drop to the invoking user
+  local aur_user="${SUDO_USER:-}"
+  if [[ -z "$aur_user" || "$aur_user" == "root" ]]; then
+    aur_user=$(logname 2>/dev/null || echo "")
+  fi
+  local aur_ok=false
+  if [[ -n "$aur_user" ]] && id "$aur_user" &>/dev/null; then
+    local home_dir
+    home_dir=$(getent passwd "$aur_user" 2>/dev/null | cut -d: -f6)
+    if runuser -u "$aur_user" -- env HOME="${home_dir:-/tmp}" \
+         "$helper" -S --needed --noconfirm mihomo; then
+      aur_ok=true
+    fi
+  fi
+  if [[ "$aur_ok" != true ]]; then
     warn "AUR install failed  -  falling back to binary install"
     install_mihomo_binary
     return
@@ -339,8 +408,8 @@ detect_iface() {
   WIRED_IFACE="$iface"
   ok "Interface: $WIRED_IFACE"
 
-  if ! command -v nmcli &>/dev/null; then
-    warn "NetworkManager not found  -  nmcli steps will be skipped."
+  if [[ "$NET_BACKEND" == "netplan" || "$NET_BACKEND" == "manual" ]]; then
+    warn "NetworkManager not found  -  IP will be set via $([[ "$NET_BACKEND" == "netplan" ]] && echo netplan || echo "manual instructions")."
     WIRED_CONN=""
     return 0
   fi
@@ -349,12 +418,26 @@ detect_iface() {
     WIRED_CONN=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep ":$WIRED_IFACE\$" | cut -d: -f1 | head -1 || true)
   fi
   if [[ -z "$WIRED_CONN" ]]; then
-    WIRED_CONN=$(nmcli -t -f NAME,TYPE con show 2>/dev/null | grep ':802-3-ethernet' | cut -d: -f1 | head -1 || true)
+    # Unmanaged device (netplan/networkd owns it)? Creating an NM profile
+    # would be ignored  -  point the user at netplan instead.
+    local state
+    state=$(nmcli -g GENERAL.STATE device show "$WIRED_IFACE" 2>/dev/null || true)
+    if [[ "$state" == *unmanaged* ]]; then
+      warn "Interface $WIRED_IFACE is unmanaged by NetworkManager (netplan/systemd-networkd controls it)."
+      NET_BACKEND="netplan"
+      WIRED_CONN=""
+      return 0
+    fi
+    # No profile ever created (fresh install, cable never plugged)  -  make one.
+    if nmcli con add type ethernet ifname "$WIRED_IFACE" con-name "mnnit-wired" &>/dev/null; then
+      WIRED_CONN="mnnit-wired"
+      ok "Created NM profile 'mnnit-wired'"
+    else
+      warn "No NetworkManager ethernet connection profile found  -  set the IP manually."
+    fi
   fi
   if [[ -n "$WIRED_CONN" ]]; then
     ok "NM connection: $WIRED_CONN"
-  else
-    warn "No NetworkManager ethernet connection profile found."
   fi
   return 0
 }
@@ -580,6 +663,12 @@ pick_hostel() {
 
 # Unattended selection path (--hostel + --ip + --yes)
 unattended_pick() {
+  if ! valid_ip "$FLAG_IP"; then
+    die "Invalid --ip '$FLAG_IP'  -  expected four dot-separated octets, e.g. 172.31.64.135"
+  fi
+  if [[ -n "$FLAG_GATEWAY" ]] && ! valid_ip "$FLAG_GATEWAY"; then
+    die "Invalid --gateway '$FLAG_GATEWAY'"
+  fi
   SELECTED_HOSTEL_IP="$FLAG_IP"
   if ! resolve_hostel_by_name "$FLAG_HOSTEL"; then
     exit 1
@@ -623,7 +712,9 @@ t = t.replace("{{TUN_ENABLE}}", tun_enable)
 sys.stdout.write(t)
 PYEOF
   ) || die "Failed to render config"
-  printf '%s\n' "$rendered" > /etc/mihomo/config.yaml
+  # Atomic write - an interrupted redirect would leave a truncated config
+  printf '%s\n' "$rendered" > /etc/mihomo/config.yaml.tmp
+  mv /etc/mihomo/config.yaml.tmp /etc/mihomo/config.yaml
   chmod 600 /etc/mihomo/config.yaml
   mihomo -t -d /etc/mihomo >/dev/null 2>&1 || {
     mihomo -t -d /etc/mihomo 2>&1 || true
@@ -632,10 +723,106 @@ PYEOF
   ok "Config generated and validated (tun: $tun_enable)"
 }
 
-# ---- static IP via NetworkManager ----
+# ---- static IP: NM / netplan / manual ----
+NETPLAN_FILE="/etc/netplan/99-mnnit-proxy.yaml"
+
+# Print a complete, copy-pasteable block (works pasted into a shell,
+# into Google, or into ChatGPT). Values are already filled in.
+print_manual_ip_instructions() {
+  cat <<EOF
+
+  No NetworkManager or netplan found  -  set your static IP manually.
+  Paste this whole block into a terminal (values are filled in for you):
+
+  ┌────────────── COPY FROM HERE ──────────────
+  │ sudo tee /etc/netplan/99-mnnit-proxy.yaml >/dev/null <<'NETPLAN'
+  │ network:
+  │   version: 2
+  │   renderer: networkd
+  │   ethernets:
+  │     $WIRED_IFACE:
+  │       dhcp4: no
+  │       addresses: [$SELECTED_HOSTEL_IP/$SELECTED_HOSTEL_PREFIX]
+  │       routes:
+  │         - to: default
+  │           via: $SELECTED_HOSTEL_GW
+  │       nameservers:
+  │         addresses: [${DNS_SRV_LIST//,/ }]
+  │ NETPLAN
+  │ sudo chmod 600 /etc/netplan/99-mnnit-proxy.yaml
+  │ sudo netplan apply
+  └────────────── COPY TO HERE ───────────────
+
+  Then verify with:  ip -4 addr show $WIRED_IFACE
+  (If your distro does not use netplan, search "set static IP $DISTRO".)
+EOF
+}
+
+# Render the netplan YAML we would write (used by write_netplan and tests).
+netplan_yaml() {
+  cat <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $WIRED_IFACE:
+      dhcp4: no
+      addresses: [$SELECTED_HOSTEL_IP/$SELECTED_HOSTEL_PREFIX]
+      routes:
+        - to: default
+          via: $SELECTED_HOSTEL_GW
+      nameservers:
+        addresses: [${DNS_SRV_LIST//,/ }]
+EOF
+}
+
+# True if any existing netplan file already configures our interface.
+# Scans the directory of NETPLAN_FILE (same base dir in prod and tests).
+netplan_iface_conflicts() {
+  local base_dir
+  base_dir="$(dirname "$NETPLAN_FILE")"
+  grep -rlE "(^|[^-[:alnum:]])$WIRED_IFACE:" "$base_dir"/*.yaml 2>/dev/null | head -1
+}
+
+apply_netplan() {
+  log "Applying static IP via netplan..."
+  local conflict
+  conflict=$(netplan_iface_conflicts || true)
+  if [[ -n "$conflict" ]]; then
+    warn "Existing netplan file already configures $WIRED_IFACE: $(basename "$conflict")"
+    warn "Not touching it  -  add these values there manually:"
+    netplan_yaml | sed 's/^/    /'
+    return 0
+  fi
+  netplan_yaml > "$NETPLAN_FILE.tmp"
+  mv "$NETPLAN_FILE.tmp" "$NETPLAN_FILE"
+  chmod 600 "$NETPLAN_FILE"
+  if netplan apply 2>/dev/null; then
+    sleep 2
+    if ip -4 addr show "$WIRED_IFACE" 2>/dev/null | grep -q "$SELECTED_HOSTEL_IP/"; then
+      ok "Static IP applied via netplan ($NETPLAN_FILE)"
+      return 0
+    fi
+    warn "netplan apply ran but the IP is not on $WIRED_IFACE yet"
+    return 0
+  fi
+  # Apply failed: roll back our file so the system is not left half-configured
+  rm -f "$NETPLAN_FILE"
+  warn "netplan apply failed  -  our config was rolled back. Instructions:"
+  print_manual_ip_instructions
+}
+
 apply_ip() {
   if [[ "$FLAG_SKIP_IP" == true ]]; then
     warn "Skipping network changes (--skip-ip)"
+    return 0
+  fi
+  if [[ "$NET_BACKEND" == "netplan" ]]; then
+    apply_netplan
+    return 0
+  fi
+  if [[ "$NET_BACKEND" == "manual" ]]; then
+    print_manual_ip_instructions
     return 0
   fi
   if [[ -z "$WIRED_CONN" ]]; then
@@ -668,6 +855,12 @@ install_watcher() {
   if [[ "$FLAG_NO_LAN_WATCH" == true ]]; then
     warn "LAN watcher skipped (--no-lan-watch)  -  mihomo will auto-start at boot."
     systemctl enable mihomo 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$NET_BACKEND" != "networkmanager" ]]; then
+    warn "NetworkManager not found  -  LAN watcher unavailable (it depends on NM events)."
+    systemctl enable mihomo 2>/dev/null || true
+    warn "mihomo will start at boot. Going home? Stop it: sudo systemctl stop mihomo"
     return 0
   fi
   if [[ "$FLAG_YES" != true ]]; then
@@ -733,18 +926,30 @@ verify() {
     fail "mihomo service  -  not active"
   fi
   if [[ "$FLAG_NO_TUN" != true ]]; then
-    if ip link show Meta &>/dev/null; then
+    # Poll up to 10s - TUN device creation can lag on slow machines
+    local tun_up=false n
+    for n in 1 2 3 4 5 6 7 8 9 10; do
+      if ip link show Meta &>/dev/null; then tun_up=true; break; fi
+      sleep 1
+    done
+    if [[ "$tun_up" == true ]]; then
       ok "TUN interface  -  present"
     else
       fail "TUN interface  -  not found"
     fi
   fi
-  local egress=""
-  local ep
-  for ep in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com" "https://ip.sb"; do
-    egress=$(curl -fsS --max-time 8 "$ep" 2>/dev/null || true)
-    [[ -n "$egress" ]] && break
-  done
+  # Test transparency: bypass any proxy env vars (boot_internet may have
+  # exported campus proxy) - if TUN works, plain curl must succeed.
+  # In --no-tun mode there is no transparency: reach out via mihomo's port.
+  local egress="" ep
+  if [[ "$FLAG_NO_TUN" == true ]]; then
+    egress=$(curl -fsS --max-time 8 -x "http://127.0.0.1:7890" "https://api.ipify.org" 2>/dev/null || true)
+  else
+    for ep in "https://ifconfig.me" "https://api.ipify.org" "https://icanhazip.com" "https://ip.sb"; do
+      egress=$(curl --noproxy '*' -fsS --max-time 8 "$ep" 2>/dev/null || true)
+      [[ -n "$egress" ]] && break
+    done
+  fi
   if [[ -n "$egress" ]]; then
     ok "Connectivity OK  -  external IP: $egress"
   else
@@ -790,6 +995,7 @@ self_install() {
   cp "$TSV" /opt/mnnit-proxy/hostels.tsv
   cp "$TEMPLATE" /opt/mnnit-proxy/config.template.yaml
   local updater="$SCRIPT_DIR/update.sh"
+  [[ -f "$updater" ]] || updater="${UPDATE_SH:-}"
   if [[ -f "$updater" ]]; then
     cp "$updater" /opt/mnnit-proxy/update.sh
     chmod +x /opt/mnnit-proxy/update.sh
@@ -920,11 +1126,21 @@ uninstall() {
     fi
   elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
     if [[ "$FLAG_YES" == true ]] || confirm "Remove mihomo package?" "n"; then
-      local helper=""
-      command -v paru &>/dev/null && helper="paru"
-      command -v yay &>/dev/null && helper="yay"
-      [[ -n "$helper" ]] && "$helper" -R --noconfirm mihomo 2>/dev/null || true
+      # paru/yay refuse to run as root  -  use pacman directly
+      if pacman -Qi mihomo &>/dev/null; then
+        pacman -R --noconfirm mihomo 2>/dev/null || true
+      elif [[ -x /usr/local/bin/mihomo ]]; then
+        # binary-fallback install: clean it up here
+        rm -f /usr/local/bin/mihomo /etc/systemd/system/mihomo.service
+        systemctl daemon-reload 2>/dev/null || true
+      fi
     fi
+  fi
+  # netplan file we may have written
+  if [[ -f "$NETPLAN_FILE" ]]; then
+    rm -f "$NETPLAN_FILE"
+    netplan apply 2>/dev/null || true
+    ok "netplan static IP removed"
   fi
   nmcli general reload 2>/dev/null || true
   ok "Uninstall complete"
@@ -934,9 +1150,10 @@ uninstall() {
 main_install() {
   log "mnnit-proxy installer v$APP_VERSION"
   echo ""
+  detect_distro
+  preflight
   ensure_data
   boot_internet
-  detect_distro
   install_mihomo
   detect_iface || true
 
@@ -1013,7 +1230,7 @@ parse_flags() {
       --non-interactive) FLAG_YES=true; shift ;;
       --uninstall)      FLAG_UNINSTALL=true; shift ;;
       --diagnose)       FLAG_DIAGNOSE=true; shift ;;
-      -h|--help)        sed -n "2,20p" "${BASH_SOURCE[0]:-$0}"; exit 0 ;;
+      -h|--help)        sed -n "2,21p" "${BASH_SOURCE[0]:-$0}"; exit 0 ;;
       *)                die "Unknown flag: $1" ;;
     esac
   done
