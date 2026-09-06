@@ -114,6 +114,54 @@ t "netplan yaml has all dns"      grep -q "172.31.100.6 172.31.100.7 172.31.100.
 tf "netplan yaml no placeholders" grep -q '{{' "$NP_DIR/99-mnnit-proxy.yaml"
 rm -rf "$NP_DIR"
 
+echo "── service-user config ownership ──"
+OWN_DIR=$(mktemp -d)
+CFG_FAKE="$OWN_DIR/fake.yaml"
+echo "x: 1" > "$CFG_FAKE"
+OWN_GRP=$(stat -c %G "$CFG_FAKE")
+chmod 600 "$CFG_FAKE"
+tf "cfg 600 not group-readable"   config_group_readable "$OWN_GRP" "$CFG_FAKE"
+chmod 640 "$CFG_FAKE"
+t  "cfg 640 correct group"        config_group_readable "$OWN_GRP" "$CFG_FAKE"
+tf "cfg 640 wrong group"          config_group_readable "nosuchgroup12345" "$CFG_FAKE"
+chmod 644 "$CFG_FAKE"
+t  "cfg 644 world-readable"       config_group_readable "nosuchgroup12345" "$CFG_FAKE"
+tf "cfg missing file"             config_group_readable "$OWN_GRP" "$OWN_DIR/nope.yaml"
+
+# fix_config_ownership with mocked systemctl/chown/chmod (records calls)
+OWBIN=$(mktemp -d)
+CALLS="$OWN_DIR/calls"; export CALLS
+cat > "$OWBIN/systemctl" <<'M'
+#!/bin/sh
+[ "$4" = "User" ] && echo mihomo
+[ "$4" = "Group" ] && echo mihomo
+exit 0
+M
+cat > "$OWBIN/chown" <<'M'
+#!/bin/sh
+echo "chown $*" >> "$CALLS"
+M
+cat > "$OWBIN/chmod" <<'M'
+#!/bin/sh
+echo "chmod $*" >> "$CALLS"
+M
+chmod +x "$OWBIN/systemctl" "$OWBIN/chown" "$OWBIN/chmod"
+OLD_PATH_OW="$PATH"
+PATH="$OWBIN:$PATH"
+rm -f "$CALLS"
+fix_config_ownership
+t "fix: chown config root:mihomo"  grep -q "^chown root:mihomo /etc/mihomo/config.yaml$" "$CALLS"
+t "fix: chmod 640 config"          grep -q "^chmod 640 /etc/mihomo/config.yaml$" "$CALLS"
+t "fix: chown dir mihomo:mihomo"   grep -q "^chown mihomo:mihomo /etc/mihomo$" "$CALLS"
+# root service (our own unit) -> no chown/chmod calls at all
+printf '#!/bin/sh\nexit 0\n' > "$OWBIN/systemctl"; chmod +x "$OWBIN/systemctl"
+rm -f "$CALLS"
+fix_config_ownership
+tf "fix: root service is a no-op"  test -s "$CALLS"
+PATH="$OLD_PATH_OW"
+unset CALLS
+rm -rf "$OWBIN" "$OWN_DIR"
+
 echo "── --help completeness ──"
 t "install.sh --help shows last flag (--diagnose)"  bash -c "bash '$REPO/install.sh' --help | grep -q -- '--diagnose'"
 t "update.sh --help shows last flag (--yes)"        bash -c "bash '$REPO/update.sh' --help | grep -q -- '--yes'"

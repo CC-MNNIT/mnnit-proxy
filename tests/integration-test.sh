@@ -241,6 +241,34 @@ NETPLAN_DIR="$NPBIN/netplan-dir" PATH="$NPBIN:$PATH" bash -c "
 tf "conflict: our file NOT written"         test -f "$NPBIN/netplan-dir/99-mnnit-proxy.yaml"
 rm -rf "$NPBIN" "$NP_OUT"; rm -f /tmp/mnnit-test-netplan-applied
 
+echo "── service-user config ownership (AUR-style unit) ──"
+# The AUR mihomo package runs the daemon as a dedicated user. Simulate that
+# unit (User=daemon) and prove fix_config_ownership adjusts perms correctly.
+OWBIN=$(mktemp -d)
+cat > "$OWBIN/systemctl" <<'M'
+#!/bin/sh
+[ "$4" = "User" ] && echo daemon
+[ "$4" = "Group" ] && echo daemon
+exit 0
+M
+chmod +x "$OWBIN/systemctl"
+ORIG_MODE=$(stat -c %a /etc/mihomo/config.yaml)
+ORIG_OWNER=$(stat -c %u:%g /etc/mihomo/config.yaml)
+ORIG_DIR_OWNER=$(stat -c %u:%g /etc/mihomo)
+PATH="$OWBIN:$PATH" bash -c "
+  source '$REPO/install.sh' 2>/dev/null
+  fix_config_ownership
+" >/dev/null 2>&1
+t "config group readable by service user"  test "$(stat -c %G /etc/mihomo/config.yaml)" = "daemon"
+t "config mode 640 (not world-readable)"   test "$(stat -c %a /etc/mihomo/config.yaml)" = "640"
+t "config still root-owned"                test "$(stat -c %U /etc/mihomo/config.yaml)" = "root"
+t "/etc/mihomo writable by service user"   test "$(stat -c %U /etc/mihomo)" = "daemon"
+# restore container state (its real unit runs as root)
+chown "$ORIG_OWNER" /etc/mihomo/config.yaml
+chmod "$ORIG_MODE" /etc/mihomo/config.yaml
+chown "$ORIG_DIR_OWNER" /etc/mihomo
+rm -rf "$OWBIN"
+
 echo "── unattended flag validation ──"
 t "invalid --ip rejected cleanly"   bash -c "bash '$REPO/install.sh' --hostel 'New Boys Hostel A Block' --ip not-an-ip --yes 2>&1 | grep -q 'Invalid --ip'"
 t "invalid --gateway rejected"      bash -c "bash '$REPO/install.sh' --hostel 'New Boys Hostel A Block' --ip 172.31.64.135 --gateway 999.1.1.1 --yes 2>&1 | grep -q 'Invalid --gateway'"

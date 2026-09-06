@@ -17,7 +17,7 @@
 #   --yes|-y           accept prompts (unattended)
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.2.0"
+readonly APP_VERSION="1.2.1"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
@@ -493,6 +493,27 @@ apply_ip() {
   fi
 }
 
+# ---- config ownership for packaged units (AUR mihomo runs as its own user) ----
+fix_config_ownership() {
+  local srv_user srv_group
+  srv_user=$(systemctl show mihomo -p User --value 2>/dev/null || true)
+  srv_group=$(systemctl show mihomo -p Group --value 2>/dev/null || true)
+  if [[ -z "$srv_user" || "$srv_user" == "root" ]]; then
+    return 0
+  fi
+  if [[ -z "$srv_group" ]]; then
+    srv_group="$srv_user"
+  fi
+  if chown "root:$srv_group" /etc/mihomo/config.yaml 2>/dev/null \
+     && chmod 640 /etc/mihomo/config.yaml 2>/dev/null \
+     && chown "$srv_user:$srv_group" /etc/mihomo 2>/dev/null; then
+    ok "Config ownership adjusted for service user '$srv_user'"
+  else
+    warn "Could not adjust config ownership for '$srv_user'. If mihomo cannot read the config:"
+    warn "  sudo chown root:$srv_group /etc/mihomo/config.yaml && sudo chmod 640 /etc/mihomo/config.yaml"
+  fi
+}
+
 gen_config() {
   log "Regenerating config..."
   local proxy_entries="" proxy_names=""
@@ -533,6 +554,7 @@ PYEOF
   printf '%s\n' "$rendered" > /etc/mihomo/config.yaml.tmp
   mv /etc/mihomo/config.yaml.tmp /etc/mihomo/config.yaml
   chmod 600 /etc/mihomo/config.yaml
+  fix_config_ownership
   mihomo -t -d /etc/mihomo >/dev/null 2>&1 || {
     mihomo -t -d /etc/mihomo 2>&1 || true
     die "Config validation failed"

@@ -21,7 +21,7 @@
 #   --diagnose         run diagnostics
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.2.0"
+readonly APP_VERSION="1.2.1"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
@@ -677,6 +677,53 @@ unattended_pick() {
   ok "Unattended: $SELECTED_HOSTEL_NAME  -  $SELECTED_HOSTEL_IP/$SELECTED_HOSTEL_PREFIX via $SELECTED_HOSTEL_GW"
 }
 
+# ---- config ownership for packaged units ----
+# Distro packages (e.g. the AUR mihomo package) run the daemon as a dedicated
+# user instead of root. We write the config root:root 600 - grant the service
+# user read access and make /etc/mihomo writable (mihomo stores cache.db
+# next to the config). Our own unit (binary install) runs as root: no-op.
+fix_config_ownership() {
+  local srv_user srv_group
+  srv_user=$(systemctl show mihomo -p User --value 2>/dev/null || true)
+  srv_group=$(systemctl show mihomo -p Group --value 2>/dev/null || true)
+  if [[ -z "$srv_user" || "$srv_user" == "root" ]]; then
+    return 0
+  fi
+  if [[ -z "$srv_group" ]]; then
+    srv_group="$srv_user"
+  fi
+  if chown "root:$srv_group" /etc/mihomo/config.yaml 2>/dev/null \
+     && chmod 640 /etc/mihomo/config.yaml 2>/dev/null \
+     && chown "$srv_user:$srv_group" /etc/mihomo 2>/dev/null; then
+    ok "Config ownership adjusted for service user '$srv_user'"
+  else
+    warn "Could not adjust config ownership for '$srv_user'. If mihomo cannot read the config:"
+    warn "  sudo chown root:$srv_group /etc/mihomo/config.yaml && sudo chmod 640 /etc/mihomo/config.yaml"
+  fi
+}
+
+# True if the config at $2 (default /etc/mihomo/config.yaml) is readable by
+# group $1 or world-readable. Pure stat - no privilege needed.
+config_group_readable() {
+  local grp="${1:-}"
+  local path="${2:-/etc/mihomo/config.yaml}"
+  local mode cfg_grp
+  mode=$(stat -c %a "$path" 2>/dev/null || true)
+  if [[ ! "$mode" =~ ^[0-7]{3,4}$ ]]; then
+    return 1
+  fi
+  if [[ "${mode: -1}" =~ [4567] ]]; then
+    return 0
+  fi
+  if [[ "${mode: -2:1}" =~ [4567] ]]; then
+    cfg_grp=$(stat -c %G "$path" 2>/dev/null || true)
+    if [[ -n "$grp" && "$cfg_grp" == "$grp" ]]; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 # ---- config generation ----
 gen_config() {
   log "Generating mihomo config..."
@@ -716,6 +763,7 @@ PYEOF
   printf '%s\n' "$rendered" > /etc/mihomo/config.yaml.tmp
   mv /etc/mihomo/config.yaml.tmp /etc/mihomo/config.yaml
   chmod 600 /etc/mihomo/config.yaml
+  fix_config_ownership
   mihomo -t -d /etc/mihomo >/dev/null 2>&1 || {
     mihomo -t -d /etc/mihomo 2>&1 || true
     die "Config validation failed  -  see errors above"
@@ -925,6 +973,19 @@ verify() {
   else
     fail "mihomo service  -  not active"
   fi
+  # Packaged units (AUR) run as a dedicated user - config must be readable by it
+  local srv_user srv_group
+  srv_user=$(systemctl show mihomo -p User --value 2>/dev/null || true)
+  srv_group=$(systemctl show mihomo -p Group --value 2>/dev/null || true)
+  srv_group="${srv_group:-$srv_user}"
+  if [[ -n "$srv_user" && "$srv_user" != "root" ]]; then
+    if config_group_readable "$srv_group"; then
+      ok "Config readable by service user ($srv_user)"
+    else
+      fail "Config NOT readable by service user ($srv_user)"
+      echo "   Fix: sudo chown root:$srv_group /etc/mihomo/config.yaml && sudo chmod 640 /etc/mihomo/config.yaml"
+    fi
+  fi
   if [[ "$FLAG_NO_TUN" != true ]]; then
     # Poll up to 10s - TUN device creation can lag on slow machines
     local tun_up=false n
@@ -1038,6 +1099,23 @@ diagnose() {
   else
     fail "Config has errors:"
     mihomo -t -d /etc/mihomo 2>&1 | head -5 || true
+  fi
+  echo ""
+  # Ownership vs the service user (AUR package runs as its own user)
+  local srv_user srv_group
+  srv_user=$(systemctl show mihomo -p User --value 2>/dev/null || true)
+  srv_group=$(systemctl show mihomo -p Group --value 2>/dev/null || true)
+  srv_group="${srv_group:-$srv_user}"
+  if [[ -n "$srv_user" && "$srv_user" != "root" ]]; then
+    echo "   Service runs as: $srv_user:$srv_group"
+    if config_group_readable "$srv_group"; then
+      ok "Config readable by $srv_user"
+    else
+      fail "Config NOT readable by $srv_user  -  mihomo cannot start"
+      echo "   Fix: sudo chown root:$srv_group /etc/mihomo/config.yaml"
+      echo "        sudo chmod 640 /etc/mihomo/config.yaml"
+      echo "        sudo chown $srv_user:$srv_group /etc/mihomo   # cache.db writes"
+    fi
   fi
   echo ""
   detect_iface || true

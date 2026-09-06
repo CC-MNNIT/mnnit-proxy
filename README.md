@@ -93,6 +93,16 @@ If an existing netplan file already manages your interface, the installer never 
 
 **Missing requirements** (curl/python3/iproute2/systemd) are checked before anything else and the installer exits with the exact install command for your distro.
 
+**Arch (AUR): "permission denied" reading /etc/mihomo/config.yaml**
+
+The AUR mihomo package runs the daemon as a dedicated `mihomo` user. Installs from v1.2.0 or earlier left the config `root:root 600`, so the service could not read it. v1.2.1+ fixes ownership automatically during install and on every config change. Manual fix for existing installs:
+
+```bash
+sudo chown root:mihomo /etc/mihomo/config.yaml
+sudo chmod 640 /etc/mihomo/config.yaml
+sudo chown mihomo:mihomo /etc/mihomo   # mihomo writes cache.db here
+```
+
 ## Uninstall
 
 ```bash
