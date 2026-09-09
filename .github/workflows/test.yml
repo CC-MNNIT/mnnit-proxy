@@ -31,6 +31,15 @@ jobs:
       - name: Run integration tests (tinyproxy stand-in + unattended install + dispatcher)
         run: sudo bash tests/integration-test.sh "$GITHUB_WORKSPACE"
 
+  fedora:
+    name: Integration (fedora)
+    needs: unit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run integration tests in a systemd-enabled Fedora container
+        run: bash tests/docker-fedora.sh "$GITHUB_WORKSPACE"
+
   arch:
     name: Arch binary-install path
     needs: unit

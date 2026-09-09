@@ -5,7 +5,7 @@
 System-wide college proxy for MNNIT Allahabad  -  works for ALL apps, no per-app setup.
 
 Powered by **mihomo** (TUN mode)  -  like Proxifier on Windows, but for Linux.  
-Supports Arch and Ubuntu (x86_64 / arm64).
+Supports Arch, Fedora/RHEL-family and Debian/Ubuntu (x86_64 / arm64).
 
 ## Quick start
 
@@ -71,7 +71,7 @@ Full list: [MNNIT Computer Centre  -  IP Address Scheme](https://mnnit.ac.in/com
 
 If the installer doesn't work for your distro or network:
 
-1. Install mihomo (Arch: `paru -S mihomo`, Ubuntu: download binary from GitHub releases)
+1. Install mihomo (Arch: `paru -S mihomo`; Ubuntu/Fedora/RHEL: download binary from GitHub releases)
 2. Copy `config.template.yaml` to `/etc/mihomo/config.yaml` and fill in proxy IPs
 3. Set static IP via nmcli (see `hostels.tsv` for your hostel's gateway/subnet)
 4. `sudo systemctl enable --now mihomo`
@@ -130,10 +130,11 @@ sudo bash install.sh --uninstall
 bash tests/unit-tests.sh          # syntax, shellcheck, function tests (no root)
 sudo bash tests/integration-test.sh   # full unattended install + proxy e2e (Debian/Ubuntu)
 bash tests/docker-ubuntu.sh       # same, inside a systemd-enabled Ubuntu container
+bash tests/docker-fedora.sh       # same, inside a systemd-enabled Fedora container
 bash tests/run-tests.sh arch      # Arch binary-install path (root/container)
 ```
 
-CI runs the same tests on every push: Ubuntu 22.04 + 24.04 (tinyproxy stands in for the college proxy with the same Basic-auth mechanics) plus an Arch container for the binary-install path.
+CI runs the same tests on every push: Ubuntu 22.04 + 24.04 (tinyproxy stands in for the college proxy with the same Basic-auth mechanics), a Fedora container for the RHEL-family path, plus an Arch container for the binary-install path.
 
 ## Structure
 

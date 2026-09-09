@@ -21,7 +21,7 @@
 #   --diagnose         run diagnostics
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.2.1"
+readonly APP_VERSION="1.2.2"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
@@ -197,9 +197,10 @@ detect_distro() {
   local id
   id=$(. /etc/os-release && echo "${ID:-unknown}")
   case "$id" in
-    arch|manjaro|endeavouros|archarm|cachyos) DISTRO="$id"; DISTRO_FAMILY="arch" ;;
-    ubuntu|debian|linuxmint|pop|neon)         DISTRO="$id"; DISTRO_FAMILY="debian" ;;
-    *)                                        DISTRO="$id"; DISTRO_FAMILY="other" ;;
+    arch|manjaro|endeavouros|archarm|cachyos)      DISTRO="$id"; DISTRO_FAMILY="arch" ;;
+    ubuntu|debian|linuxmint|pop|neon)              DISTRO="$id"; DISTRO_FAMILY="debian" ;;
+    fedora|rhel|centos|almalinux|rocky|nobara)     DISTRO="$id"; DISTRO_FAMILY="rhel" ;;
+    *)                                             DISTRO="$id"; DISTRO_FAMILY="other" ;;
   esac
   log "Detected: $DISTRO ($DISTRO_FAMILY)"
 }
@@ -233,6 +234,7 @@ preflight() {
     case "$DISTRO_FAMILY" in
       arch)   hint="sudo pacman -S curl python iproute2 systemd" ;;
       debian) hint="sudo apt install curl python3 iproute2" ;;
+      rhel)   hint="sudo dnf install curl python3 iproute" ;;
       *)      hint="install curl, python3 and iproute2 with your package manager" ;;
     esac
     die "Install them first, then re-run:  $hint"
@@ -250,9 +252,9 @@ install_mihomo() {
     return 0
   fi
   case "$DISTRO_FAMILY" in
-    arch)   install_mihomo_arch ;;
-    debian) install_mihomo_binary ;;
-    *)      die "Unsupported distro '$DISTRO'  -  see README for manual steps." ;;
+    arch)          install_mihomo_arch ;;
+    debian|rhel)   install_mihomo_binary ;;
+    *)             die "Unsupported distro '$DISTRO'  -  see README for manual steps." ;;
   esac
 }
 
@@ -1197,21 +1199,15 @@ uninstall() {
   rm -rf /etc/mihomo
   rm -rf /opt/mnnit-proxy
   rm -f /usr/local/bin/mnnit-proxy-update
-  if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-    if [[ "$FLAG_YES" == true ]] || confirm "Remove mihomo binary?" "n"; then
+  if [[ "$FLAG_YES" == true ]] || confirm "Remove mihomo binary/package?" "n"; then
+    # Package-manager-agnostic: pacman package (Arch) or binary install
+    # (Debian, Fedora/RHEL, Arch fallback) at /usr/local/bin.
+    if command -v pacman &>/dev/null && pacman -Qi mihomo &>/dev/null; then
+      # paru/yay refuse to run as root  -  use pacman directly
+      pacman -R --noconfirm mihomo 2>/dev/null || true
+    elif [[ -x /usr/local/bin/mihomo ]]; then
       rm -f /usr/local/bin/mihomo /etc/systemd/system/mihomo.service
       systemctl daemon-reload 2>/dev/null || true
-    fi
-  elif [[ "$DISTRO_FAMILY" == "arch" ]]; then
-    if [[ "$FLAG_YES" == true ]] || confirm "Remove mihomo package?" "n"; then
-      # paru/yay refuse to run as root  -  use pacman directly
-      if pacman -Qi mihomo &>/dev/null; then
-        pacman -R --noconfirm mihomo 2>/dev/null || true
-      elif [[ -x /usr/local/bin/mihomo ]]; then
-        # binary-fallback install: clean it up here
-        rm -f /usr/local/bin/mihomo /etc/systemd/system/mihomo.service
-        systemctl daemon-reload 2>/dev/null || true
-      fi
     fi
   fi
   # netplan file we may have written

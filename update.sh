@@ -17,7 +17,7 @@
 #   --yes|-y           accept prompts (unattended)
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.2.1"
+readonly APP_VERSION="1.2.2"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"

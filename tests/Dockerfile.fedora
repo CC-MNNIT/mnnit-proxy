@@ -1,0 +1,11 @@
+# Fedora test image with systemd enabled - used by tests/docker-fedora.sh
+# Verifies the RHEL-family install path (dnf, NetworkManager-native, binary mihomo).
+FROM fedora:latest
+
+RUN dnf install -y -q \
+      systemd sudo curl ca-certificates iproute python3 gzip tinyproxy && \
+    dnf clean all
+
+# systemd as PID 1
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
