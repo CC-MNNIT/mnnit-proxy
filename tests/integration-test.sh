@@ -181,9 +181,22 @@ ip link set dummy0 up
 
 echo "── update.sh actions ──"
 t "status action exits 0"    bash "$REPO/update.sh" --action status
-t "change-ip regenerates"    env MNNIT_FORCE_BACKEND=manual bash "$REPO/update.sh" --action change-ip \
-                               --hostel "Post Graduate Hostel" \
-                               --ip 172.31.144.50 --yes --force
+UPDATE_IFACE=$(ip route show default 2>/dev/null | awk '/ dev /{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+if [[ ! "$UPDATE_IFACE" =~ ^(en|eth) ]]; then
+  UPDATE_IFACE=$(find /sys/class/net -maxdepth 1 -type l -printf '%f\n' 2>/dev/null | grep -E '^(en|eth)' | head -1 || true)
+fi
+UPDATE_OUT=$(mktemp)
+if env MNNIT_FORCE_BACKEND=manual bash "$REPO/update.sh" --action change-ip \
+     --hostel "Post Graduate Hostel" \
+     --ip 172.31.144.50 --yes --force \
+     --interface "$UPDATE_IFACE" >"$UPDATE_OUT" 2>&1; then
+  echo "  ✓ change-ip regenerates"; PASS=$((PASS+1))
+else
+  echo "  ✗ change-ip regenerates  -  output:"
+  tail -20 "$UPDATE_OUT"
+  FAIL=$((FAIL+1))
+fi
+rm -f "$UPDATE_OUT"
 t "config now has PG proxy"  grep -q "server: 172.31.100.25" /etc/mihomo/config.yaml
 t "mihomo still active"      systemctl is-active mihomo
 ip link del dummy0 2>/dev/null || true
