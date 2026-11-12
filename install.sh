@@ -1753,6 +1753,31 @@ parse_flags() {
   fi
 }
 
+validate_install_flags() {
+  if [[ -n "$FLAG_IP" ]] && ! valid_ip "$FLAG_IP"; then
+    die "Invalid --ip '$FLAG_IP'  -  expected four dot-separated octets, e.g. 172.31.64.135"
+  fi
+  if [[ -n "$FLAG_GATEWAY" ]] && ! valid_ip "$FLAG_GATEWAY"; then
+    die "Invalid --gateway '$FLAG_GATEWAY'"
+  fi
+  if [[ "$FLAG_YES" == true && ( -z "$FLAG_HOSTEL" || -z "$FLAG_IP" ) ]]; then
+    die "--yes needs both --hostel and --ip"
+  fi
+  if [[ -n "$FLAG_HOSTEL" || -n "$FLAG_IP" ]]; then
+    if [[ "$FLAG_YES" != true || -z "$FLAG_HOSTEL" || -z "$FLAG_IP" ]]; then
+      die "Unattended selection needs --hostel NAME --ip IP --yes"
+    fi
+  fi
+}
+
+install_flags_requested() {
+  [[ -n "$FLAG_HOSTEL" || -n "$FLAG_IP" || -n "$FLAG_GATEWAY" \
+     || -n "$FLAG_INTERFACE" || -n "$FLAG_TUN_STACK" \
+     || "$FLAG_FORCE" == true || "$FLAG_YES" == true \
+     || "$FLAG_SKIP_IP" == true || "$FLAG_NO_TUN" == true \
+     || "$FLAG_NO_LAN_WATCH" == true ]]
+}
+
 main() {
   parse_flags "$@"
   if [[ "${FLAG_UNINSTALL:-false}" == true ]]; then
@@ -1768,6 +1793,7 @@ main() {
     diagnose
     return 0
   fi
+  validate_install_flags
   if [[ $EUID -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" != "-" && -f "${BASH_SOURCE[0]}" && -r /dev/tty ]]; then
       warn "This script needs root. Re-running with sudo..."
@@ -1775,7 +1801,8 @@ main() {
     fi
     die "This script needs root. Run: curl -fsSL <URL> | sudo bash"
   fi
-  if command -v mihomo &>/dev/null || [[ -f /etc/mihomo/config.yaml ]]; then
+  if (command -v mihomo &>/dev/null || [[ -f /etc/mihomo/config.yaml ]]) \
+     && ! install_flags_requested; then
     show_menu
   else
     main_install

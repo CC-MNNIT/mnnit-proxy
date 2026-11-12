@@ -181,7 +181,7 @@ ip link set dummy0 up
 
 echo "── update.sh actions ──"
 t "status action exits 0"    bash "$REPO/update.sh" --action status
-t "change-ip regenerates"    bash "$REPO/update.sh" --action change-ip \
+t "change-ip regenerates"    env MNNIT_FORCE_BACKEND=manual bash "$REPO/update.sh" --action change-ip \
                                --hostel "Post Graduate Hostel" \
                                --ip 172.31.144.50 --yes --force
 t "config now has PG proxy"  grep -q "server: 172.31.100.25" /etc/mihomo/config.yaml
