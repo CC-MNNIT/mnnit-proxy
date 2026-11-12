@@ -118,6 +118,10 @@ with open(template_path) as f:
 t = t.replace("{{PROXY_ENTRIES}}", proxies_block)
 t = t.replace("{{PROXY_NAMES}}", "proxy-1")
 t = t.replace("{{TUN_ENABLE}}", "false")
+t = t.replace("{{TUN_STACK}}", "gvisor")
+t = t.replace("{{INTERFACE_CONFIG}}\n", "")
+t = t.replace("{{INTERFACE_CONFIG}}", "")
+t = t.replace("{{AUTO_DETECT_INTERFACE}}", "true")
 with open(out_path, "w") as f:
     f.write(t)
 PYEOF

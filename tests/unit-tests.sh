@@ -191,31 +191,18 @@ derive_network
 t "--gateway overrides"        test "$SELECTED_HOSTEL_GW" = "172.31.137.1"
 unset FLAG_GATEWAY
 
-echo "── should_start_mihomo decision matrix ──"
-# Matrix: [watcher-installed?] x [campus-gateway-present?]
-# Watcher rule dominates: if the dispatcher file exists, NEVER start.
-DISP=/etc/NetworkManager/dispatcher.d/90-mihomo-lan
-if [[ -f "$DISP" ]]; then
-  tf "watcher present -> never force-start" should_start_mihomo
-  if [[ $EUID -eq 0 ]]; then
-    # root: can temporarily remove dispatcher to test the no-watcher branch
-    mv "$DISP" "$DISP.unittest"
-    if ip route show default 2>/dev/null | grep -q "via 172.31."; then
-      t "no watcher + campus link -> start" should_start_mihomo
-    else
-      tf "no watcher + no campus link -> don't start" should_start_mihomo
-    fi
-    mv "$DISP.unittest" "$DISP"
-  else
-    echo "  - watcher installed on this machine; no-watcher branch covered by CI"
-  fi
+echo "── campus-link start decision ──"
+if campus_link; then
+  t "campus address + carrier -> start" should_start_mihomo
 else
-  if ip route show default 2>/dev/null | grep -q "via 172.31."; then
-    t "no watcher + campus link -> start" should_start_mihomo
-  else
-    tf "no watcher + no campus link -> don't start" should_start_mihomo
-  fi
+  tf "no live campus address -> don't start" should_start_mihomo
 fi
+
+echo "── tun stack validation ──"
+for stack in system gvisor mixed mips; do
+  t "stack accepted: $stack" valid_tun_stack "$stack"
+done
+tf "invalid stack rejected" valid_tun_stack nope
 
 echo "── config rendering ──"
 # PROXY_PORT/PROXY_USER/PROXY_PASS are already set (readonly) by sourcing install.sh
@@ -223,14 +210,23 @@ TEMPLATE="$REPO/config.template.yaml"
 SELECTED_HOSTEL_PROXIES="172.31.100.27,172.31.102.29"
 OUT=$(mktemp)
 render_cfg() {
-  python3 - "$1" "$2" "$3" "$TEMPLATE" <<'PYEOF'
+  python3 - "$1" "$2" "$3" "$4" "$5" "$TEMPLATE" <<'PYEOF'
+import json
 import sys
-proxy_entries, proxy_names, tun_enable, template_path = sys.argv[1:5]
+proxy_entries, proxy_names, tun_enable, tun_stack, outbound_iface, template_path = sys.argv[1:7]
 with open(template_path) as f:
     t = f.read()
 t = t.replace("{{PROXY_ENTRIES}}", proxy_entries.rstrip("\n"))
 t = t.replace("{{PROXY_NAMES}}", proxy_names)
 t = t.replace("{{TUN_ENABLE}}", tun_enable)
+t = t.replace("{{TUN_STACK}}", tun_stack)
+if outbound_iface:
+    t = t.replace("{{INTERFACE_CONFIG}}", "interface-name: " + json.dumps(outbound_iface))
+    t = t.replace("{{AUTO_DETECT_INTERFACE}}", "false")
+else:
+    t = t.replace("{{INTERFACE_CONFIG}}\n", "")
+    t = t.replace("{{INTERFACE_CONFIG}}", "")
+    t = t.replace("{{AUTO_DETECT_INTERFACE}}", "true")
 sys.stdout.write(t)
 PYEOF
 }
@@ -246,16 +242,22 @@ for p in "${plist[@]}"; do
   [[ -n "$pn" ]] && pn+=", "
   pn+="proxy-${idx}"
 done
-render_cfg "$pe" "$pn" "true" > "$OUT"
+render_cfg "$pe" "$pn" "true" "gvisor" "enp0s8" > "$OUT"
 grep -q "server: 172.31.100.27" "$OUT"; t "proxy-1 rendered"       test $? -eq 0
 grep -q "proxies: \[proxy-1, proxy-2\]" "$OUT"; t "group names rendered" test $? -eq 0
 grep -q "enable: true" "$OUT";                 t "tun enabled default"    test $? -eq 0
+grep -q "stack: gvisor" "$OUT";                t "gvisor stack rendered"  test $? -eq 0
+grep -q 'interface-name: "enp0s8"' "$OUT";     t "outbound interface pinned" test $? -eq 0
+grep -q "auto-detect-interface: false" "$OUT"; t "auto detection disabled when pinned" test $? -eq 0
+grep -q "^sniffer:" "$OUT";                    t "domain sniffer rendered" test $? -eq 0
+grep -q "parse-pure-ip: true" "$OUT";           t "pure-IP traffic sniffed" test $? -eq 0
 if grep -q "{{" "$OUT"; then echo "  ✗ leftover placeholders"; FAIL=$((FAIL+1)); else echo "  ✓ no leftover placeholders"; PASS=$((PASS+1)); fi
-render_cfg "$pe" "$pn" "false" > "$OUT"
+render_cfg "$pe" "$pn" "false" "system" "" > "$OUT"
 grep -q "enable: false" "$OUT"; t "--no-tun renders enable:false"  test $? -eq 0
+grep -q "auto-detect-interface: true" "$OUT"; t "no pin keeps auto detection" test $? -eq 0
 
 if command -v mihomo >/dev/null 2>&1; then
-  render_cfg "$pe" "$pn" "false" > "$OUT"
+  render_cfg "$pe" "$pn" "false" "gvisor" "enp0s8" > "$OUT"
   TD=$(mktemp -d); cp "$OUT" "$TD/config.yaml"
   if mihomo -t -d "$TD" >/dev/null 2>&1; then
     echo "  ✓ mihomo accepts rendered config"; PASS=$((PASS+1))

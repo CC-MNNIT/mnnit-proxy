@@ -1,14 +1,15 @@
 # mnnit-proxy mihomo config  -  rendered by install.sh/update.sh (do not edit placeholders by hand)
 mixed-port: 7890
+{{INTERFACE_CONFIG}}
 mode: rule
 log-level: info
 ipv6: false
 
 tun:
   enable: {{TUN_ENABLE}}
-  stack: system
+  stack: {{TUN_STACK}}
   auto-route: true
-  auto-detect-interface: true
+  auto-detect-interface: {{AUTO_DETECT_INTERFACE}}
   dns-hijack: [any:53]
   route-exclude-address:
     - 10.0.0.0/8
@@ -20,6 +21,20 @@ dns:
   enhanced-mode: fake-ip
   nameserver: [172.31.100.6, 172.31.100.7, 172.31.100.8]
   default-nameserver: [172.31.100.6, 172.31.100.7]
+
+# The campus HTTP proxies reliably accept hostname CONNECT requests, but some
+# destinations time out when mihomo only has their resolved IP. Recover the
+# HTTP Host / TLS SNI from transparent TUN traffic before selecting an outbound.
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443]
 
 proxies:
 {{PROXY_ENTRIES}}

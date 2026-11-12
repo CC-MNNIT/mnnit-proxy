@@ -15,6 +15,8 @@
 #   --gateway IP       override the derived gateway
 #   --force            proceed even if IP is outside the documented range
 #   --yes|-y           accept prompts (unattended)
+#   --interface IFACE  campus Ethernet interface
+#   --tun-stack STACK  system|gvisor|mixed|mips (preserves current if omitted)
 set -Eeuo pipefail
 
 readonly APP_VERSION="1.2.2"
@@ -23,6 +25,7 @@ readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
 readonly DNS_SRV="172.31.100.6, 172.31.100.7, 172.31.100.8"
 readonly DNS_SRV_LIST="172.31.100.6,172.31.100.7,172.31.100.8"
+readonly DEFAULT_TUN_STACK="gvisor"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || pwd)"
 if [[ -f "$SCRIPT_DIR/hostels.tsv" && -f "$SCRIPT_DIR/config.template.yaml" ]]; then
@@ -51,6 +54,8 @@ FLAG_IP=""
 FLAG_GATEWAY=""
 FLAG_FORCE=false
 FLAG_YES=false
+FLAG_INTERFACE=""
+FLAG_TUN_STACK=""
 ACTION=""
 
 if [[ -t 1 ]]; then
@@ -212,9 +217,53 @@ preflight() {
   detect_backend
 }
 
+valid_tun_stack() {
+  case "$1" in
+    system|gvisor|mixed|mips) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+find_wired_connection() {
+  WIRED_CONN=""
+  local uuid type ifname addresses fallback="" active_uuid=""
+  active_uuid=$(nmcli -g GENERAL.CON-UUID device show "$WIRED_IFACE" 2>/dev/null | head -1 || true)
+  if [[ -n "$active_uuid" && "$active_uuid" != "--" ]]; then
+    WIRED_CONN="$active_uuid"
+    return 0
+  fi
+  while IFS=: read -r uuid type; do
+    [[ "$type" == "802-3-ethernet" || "$type" == "ethernet" ]] || continue
+    ifname=$(nmcli -g connection.interface-name con show "$uuid" 2>/dev/null | head -1 || true)
+    [[ "$ifname" == "$WIRED_IFACE" ]] || continue
+    [[ -n "$fallback" ]] || fallback="$uuid"
+    addresses=$(nmcli -g ipv4.addresses con show "$uuid" 2>/dev/null || true)
+    if [[ "$addresses" == 172.31.* ]]; then
+      WIRED_CONN="$uuid"
+      return 0
+    fi
+  done < <(nmcli -t -f UUID,TYPE con show 2>/dev/null || true)
+  WIRED_CONN="$fallback"
+  [[ -n "$WIRED_CONN" ]]
+}
+
+ensure_wired_connection() {
+  [[ -n "$WIRED_CONN" ]] && return 0
+  local name="mnnit-wired-$WIRED_IFACE"
+  if nmcli con add type ethernet ifname "$WIRED_IFACE" con-name "$name" &>/dev/null; then
+    find_wired_connection || true
+    if [[ -n "$WIRED_CONN" ]]; then
+      ok "Created NM profile '$name'"
+      return 0
+    fi
+  fi
+  warn "Could not create a NetworkManager profile for $WIRED_IFACE."
+  return 1
+}
+
 detect_iface() {
-  local -a ifaces=()
-  local d i
+  local -a ifaces=() campus_ifaces=() carrier_ifaces=() profile_ifaces=()
+  local d i uuid type ifname addresses iface=""
   for d in /sys/class/net/*; do
     i="${d##*/}"
     [[ "$i" =~ ^(en|eth) ]] && ifaces+=("$i")
@@ -223,38 +272,67 @@ detect_iface() {
     warn "No ethernet interface found."
     return 1
   fi
-  local iface="" i2
-  for i2 in "${ifaces[@]}"; do
-    if [[ "$(cat "/sys/class/net/$i2/carrier" 2>/dev/null)" == "1" ]]; then
-      iface="$i2"; break
+
+  if [[ -n "$FLAG_INTERFACE" ]]; then
+    [[ -d "/sys/class/net/$FLAG_INTERFACE" ]] \
+      || { warn "Interface '$FLAG_INTERFACE' does not exist."; return 1; }
+    [[ "$FLAG_INTERFACE" =~ ^(en|eth) ]] \
+      || { warn "Interface '$FLAG_INTERFACE' is not Ethernet."; return 1; }
+    iface="$FLAG_INTERFACE"
+  else
+    for i in "${ifaces[@]}"; do
+      if ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4}' | grep -q '^172\.31\.'; then
+        campus_ifaces+=("$i")
+      fi
+      [[ "$(cat "/sys/class/net/$i/carrier" 2>/dev/null)" == "1" ]] && carrier_ifaces+=("$i")
+    done
+    if [[ ${#campus_ifaces[@]} -eq 1 ]]; then
+      iface="${campus_ifaces[0]}"
+    elif [[ ${#carrier_ifaces[@]} -eq 1 ]]; then
+      iface="${carrier_ifaces[0]}"
     fi
-  done
-  iface="${iface:-${ifaces[0]}}"
+    if [[ -z "$iface" && "$NET_BACKEND" == "networkmanager" ]]; then
+      while IFS=: read -r uuid type; do
+        [[ "$type" == "802-3-ethernet" || "$type" == "ethernet" ]] || continue
+        addresses=$(nmcli -g ipv4.addresses con show "$uuid" 2>/dev/null || true)
+        [[ "$addresses" == 172.31.* ]] || continue
+        ifname=$(nmcli -g connection.interface-name con show "$uuid" 2>/dev/null | head -1 || true)
+        if [[ -d "/sys/class/net/$ifname" && " ${profile_ifaces[*]} " != *" $ifname "* ]]; then
+          profile_ifaces+=("$ifname")
+        fi
+      done < <(nmcli -t -f UUID,TYPE con show 2>/dev/null || true)
+      [[ ${#profile_ifaces[@]} -ne 1 ]] || iface="${profile_ifaces[0]}"
+    fi
+    [[ -n "$iface" || ${#ifaces[@]} -ne 1 ]] || iface="${ifaces[0]}"
+  fi
+  if [[ -z "$iface" ]]; then
+    warn "Multiple Ethernet interfaces are possible: ${ifaces[*]}"
+    warn "Re-run with --interface IFACE."
+    return 1
+  fi
   WIRED_IFACE="$iface"
+
   if [[ "$NET_BACKEND" == "netplan" || "$NET_BACKEND" == "manual" ]]; then
     ok "Interface: $WIRED_IFACE (backend: $NET_BACKEND)"
     WIRED_CONN=""
     return 0
   fi
-  WIRED_CONN=$(nmcli -g GENERAL.CONNECTION device show "$WIRED_IFACE" 2>/dev/null | head -1 || true)
-  if [[ -z "$WIRED_CONN" ]]; then
-    WIRED_CONN=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep ":$WIRED_IFACE\$" | cut -d: -f1 | head -1 || true)
-  fi
-  if [[ -z "$WIRED_CONN" ]]; then
-    local state
-    state=$(nmcli -g GENERAL.STATE device show "$WIRED_IFACE" 2>/dev/null || true)
-    if [[ "$state" == *unmanaged* ]]; then
-      warn "Interface $WIRED_IFACE is unmanaged by NetworkManager  -  netplan controls it."
+  local state
+  state=$(nmcli -g GENERAL.STATE device show "$WIRED_IFACE" 2>/dev/null || true)
+  if [[ "$state" == *unmanaged* ]]; then
+    warn "Interface $WIRED_IFACE is unmanaged by NetworkManager."
+    if command -v netplan &>/dev/null && [[ -d "${NETPLAN_DIR:-/etc/netplan}" ]]; then
       NET_BACKEND="netplan"
-      WIRED_CONN=""
-      return 0
+    else
+      NET_BACKEND="manual"
     fi
-    if nmcli con add type ethernet ifname "$WIRED_IFACE" con-name "mnnit-wired" &>/dev/null; then
-      WIRED_CONN="mnnit-wired"
-      ok "Created NM profile 'mnnit-wired'"
-    fi
+    WIRED_CONN=""
+    return 0
   fi
-  ok "Interface: $WIRED_IFACE (connection: ${WIRED_CONN:-none})"
+  find_wired_connection || true
+  local conn_name=""
+  [[ -z "$WIRED_CONN" ]] || conn_name=$(nmcli -g connection.id con show "$WIRED_CONN" 2>/dev/null | head -1 || true)
+  ok "Interface: $WIRED_IFACE (connection: ${conn_name:-none})"
   return 0
 }
 
@@ -470,11 +548,15 @@ apply_ip() {
     return 0
   fi
   if [[ -z "$WIRED_CONN" ]]; then
-    warn "No NetworkManager connection profile  -  set the IP manually:"
-    warn "  nmcli con mod <name> ipv4.method manual ipv4.addresses ${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX} ipv4.gateway ${SELECTED_HOSTEL_GW} ipv4.dns \"${DNS_SRV_LIST}\""
-    return 0
+    ensure_wired_connection || {
+      warn "No NetworkManager connection profile  -  set the IP manually:"
+      warn "  nmcli con mod <name> ipv4.method manual ipv4.addresses ${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX} ipv4.gateway ${SELECTED_HOSTEL_GW} ipv4.dns \"${DNS_SRV_LIST}\""
+      return 0
+    }
   fi
-  log "Applying static IP on '$WIRED_CONN'..."
+  local conn_name
+  conn_name=$(nmcli -g connection.id con show "$WIRED_CONN" 2>/dev/null | head -1 || true)
+  log "Applying static IP on '${conn_name:-$WIRED_CONN}'..."
   nmcli con mod "$WIRED_CONN" \
     ipv4.method manual \
     ipv4.addresses "${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX}" \
@@ -537,16 +619,37 @@ gen_config() {
     if [[ "$cur" == "false" ]]; then tun_enable="false"; fi
   fi
 
+  local tun_stack="${FLAG_TUN_STACK:-}"
+  if [[ -z "$tun_stack" && -f /etc/mihomo/config.yaml ]]; then
+    tun_stack=$(awk '/^tun:/{f=1;next} f && /^  stack:/{print $2; exit}' /etc/mihomo/config.yaml)
+  fi
+  tun_stack="${tun_stack:-$DEFAULT_TUN_STACK}"
+  valid_tun_stack "$tun_stack" \
+    || die "Invalid TUN stack '$tun_stack' (use system|gvisor|mixed|mips)"
+  local outbound_iface="$WIRED_IFACE"
+
   mkdir -p /etc/mihomo
   local rendered
-  rendered=$(python3 - "$proxy_entries" "$proxy_names" "$tun_enable" "$TEMPLATE" <<'PYEOF'
+  rendered=$(python3 - "$proxy_entries" "$proxy_names" "$tun_enable" \
+    "$tun_stack" "$outbound_iface" "$TEMPLATE" <<'PYEOF'
+import json
 import sys
-proxy_entries, proxy_names, tun_enable, template_path = sys.argv[1:5]
+proxy_entries, proxy_names, tun_enable, tun_stack, outbound_iface, template_path = sys.argv[1:7]
 with open(template_path) as f:
     t = f.read()
 t = t.replace("{{PROXY_ENTRIES}}", proxy_entries.rstrip("\n"))
 t = t.replace("{{PROXY_NAMES}}", proxy_names)
 t = t.replace("{{TUN_ENABLE}}", tun_enable)
+t = t.replace("{{TUN_STACK}}", tun_stack)
+if outbound_iface:
+    t = t.replace("{{INTERFACE_CONFIG}}", "interface-name: " + json.dumps(outbound_iface))
+    t = t.replace("{{AUTO_DETECT_INTERFACE}}", "false")
+else:
+    t = t.replace("{{INTERFACE_CONFIG}}\n", "")
+    t = t.replace("{{INTERFACE_CONFIG}}", "")
+    t = t.replace("{{AUTO_DETECT_INTERFACE}}", "true")
+if "{{" in t:
+    raise SystemExit("unrendered config placeholder")
 sys.stdout.write(t)
 PYEOF
   ) || die "Failed to render config"
@@ -560,9 +663,34 @@ PYEOF
     die "Config validation failed"
   }
   ok "Config updated (tun: $tun_enable)"
-  if systemctl is-active --quiet mihomo 2>/dev/null; then
-    systemctl restart mihomo
-    ok "mihomo restarted"
+}
+
+campus_link() {
+  local d i
+  for d in /sys/class/net/*; do
+    i="${d##*/}"
+    [[ "$i" == "lo" ]] && continue
+    [[ "$i" == Meta* || "$i" == utun* || "$i" == tun* ]] && continue
+    [[ "$(cat "$d/carrier" 2>/dev/null)" == "1" ]] || continue
+    if ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4}' | grep -q '^172\.31\.'; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+reconcile_mihomo() {
+  if campus_link; then
+    if systemctl is-active --quiet mihomo 2>/dev/null; then
+      systemctl restart mihomo
+      ok "mihomo restarted with the new config"
+    else
+      systemctl start mihomo
+      ok "mihomo started on campus link"
+    fi
+  else
+    systemctl stop mihomo 2>/dev/null || true
+    warn "mihomo left stopped until a campus link is active"
   fi
 }
 
@@ -626,6 +754,7 @@ toggle_watcher() {
       rm -f "$file"
       nmcli general reload 2>/dev/null || true
       systemctl enable mihomo 2>/dev/null || true
+      reconcile_mihomo
       ok "LAN watcher removed  -  mihomo now auto-starts at boot instead."
     fi
   else
@@ -641,6 +770,7 @@ toggle_watcher() {
         install -m 755 -o root -g root "$src" "$file"
         nmcli general reload 2>/dev/null || true
         systemctl disable mihomo 2>/dev/null || true
+        reconcile_mihomo
         ok "LAN watcher installed."
       else
         warn "Dispatcher file not found  -  re-run install.sh."
@@ -664,9 +794,11 @@ menu() {
   choice=$(ask "Enter number" "1")
   case "$choice" in
     1)
+      detect_iface || die "Could not choose the campus Ethernet interface. Use --interface IFACE."
       pick_hostel
       apply_ip
       gen_config
+      reconcile_mihomo
       echo ""
       ok "Done. Configured for $SELECTED_HOSTEL_NAME."
       ;;
@@ -687,11 +819,16 @@ parse_flags() {
       --gateway)    [[ $# -lt 2 ]] && die "--gateway needs a value"; FLAG_GATEWAY="$2"; shift 2 ;;
       --yes|-y)     FLAG_YES=true; shift ;;
       --force)      FLAG_FORCE=true; shift ;;
+      --interface)  [[ $# -lt 2 ]] && die "--interface needs a value"; FLAG_INTERFACE="$2"; shift 2 ;;
+      --tun-stack)  [[ $# -lt 2 ]] && die "--tun-stack needs a value"; FLAG_TUN_STACK="$2"; shift 2 ;;
       --non-interactive) FLAG_YES=true; shift ;;
-      -h|--help)    sed -n "2,10p" "${BASH_SOURCE[0]:-$0}"; exit 0 ;;
+      -h|--help)    sed -n "2,19p" "${BASH_SOURCE[0]:-$0}"; exit 0 ;;
       *)            die "Unknown flag: $1" ;;
     esac
   done
+  if [[ -n "$FLAG_TUN_STACK" ]] && ! valid_tun_stack "$FLAG_TUN_STACK"; then
+    die "Invalid --tun-stack '$FLAG_TUN_STACK' (use system|gvisor|mixed|mips)"
+  fi
 }
 
 # Shared by change-ip action and the flag-driven default path.
@@ -705,8 +842,10 @@ unattended_change() {
   SELECTED_HOSTEL_IP="$FLAG_IP"
   if ! resolve_hostel_by_name "$FLAG_HOSTEL"; then exit 1; fi
   derive_network
+  detect_iface || die "Could not choose the campus Ethernet interface. Use --interface IFACE."
   apply_ip
   gen_config
+  reconcile_mihomo
   ok "Done. Configured for $SELECTED_HOSTEL_NAME."
 }
 

@@ -9,14 +9,19 @@ IFACE="$1"; ACTION="$2"
 [[ "$IFACE" == Meta* || "$IFACE" == utun* || "$IFACE" == tun* ]] && exit 0
 log() { logger -t mihomo-lan "$*"; }
 
-# Check if any physical interface currently has a campus (172.31.*) default gateway
+# Check if any physical interface is up with a campus (172.31.*) address.
+# Do not rely on the preferred default route: NetworkManager can temporarily
+# penalize the campus route by +20000 after a connectivity check, especially
+# while Wi-Fi is also connected.
 campus_link() {
   for d in /sys/class/net/*/; do
     i=$(basename "$d")
     [ "$i" = "lo" ] && continue
     [[ "$i" == Meta* || "$i" == utun* || "$i" == tun* ]] && continue
-    gw=$(ip route show default dev "$i" 2>/dev/null | awk '{print $3}')
-    [[ "$gw" == 172.31.* ]] && return 0
+    [[ "$(cat "$d/carrier" 2>/dev/null)" == "1" ]] || continue
+    if ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4}' | grep -q '^172\.31\.'; then
+      return 0
+    fi
   done
   return 1
 }
@@ -29,8 +34,7 @@ case "$ACTION" in
       if systemctl is-active --quiet mihomo 2>/dev/null; then
         exit 0  # already running - no duplicate starts/log noise
       fi
-      GW=$(ip route show default dev "$IFACE" 2>/dev/null | awk '{print $3}')
-      log "campus gateway $GW detected on $IFACE -> starting mihomo"
+      log "campus address detected on $IFACE -> starting mihomo"
       systemctl start mihomo || log "start failed"
     else
       log "$IFACE up but not on campus network -> stopping mihomo"

@@ -71,8 +71,7 @@ case "$V" in
   *) echo "  ✗ pinned version used (got: ${V:-none})"; FAIL=$((FAIL+1)) ;;
 esac
 
-echo "── should_start_mihomo: full matrix as root ──"
-rm -f /etc/NetworkManager/dispatcher.d/90-mihomo-lan 2>/dev/null || true
+echo "── should_start_mihomo: campus-link state ──"
 # No campus link (container default) -> don't start
 if should_start_mihomo; then
   echo "  ✗ no campus link but would start"; FAIL=$((FAIL+1))
@@ -89,15 +88,6 @@ if should_start_mihomo; then
 else
   echo "  ✗ campus link but wouldn't start"; FAIL=$((FAIL+1))
 fi
-# Watcher installed -> never start even with campus link
-mkdir -p /etc/NetworkManager/dispatcher.d
-touch /etc/NetworkManager/dispatcher.d/90-mihomo-lan
-if should_start_mihomo; then
-  echo "  ✗ watcher present but would start"; FAIL=$((FAIL+1))
-else
-  echo "  ✓ watcher present -> don't start"; PASS=$((PASS+1))
-fi
-rm -f /etc/NetworkManager/dispatcher.d/90-mihomo-lan
 ip route del default dev dummy0 metric 50 2>/dev/null || true
 ip link del dummy0 2>/dev/null || true
 echo "ARCH-PASS=$PASS ARCH-FAIL=$FAIL"
