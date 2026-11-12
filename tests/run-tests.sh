@@ -49,10 +49,10 @@ t "config generated"   test -f /etc/mihomo/config.yaml
 t "config validated"   mihomo -t -d /etc/mihomo
 
 echo "── pinned fallback when GitHub API fails ──"
-# Mock download(): API requests fail (like rate-limiting), asset downloads
-# go through the same mirror chain as the real function (resilient to flaky TLS).
+# Simulate a rate-limited release API; asset downloads still use the normal
+# mirror chain and must match the hard-coded pinned SHA-256 digest.
+fetch_release_metadata() { return 1; }
 download() {
-  if [[ "$1" == *"api.github.com"* ]]; then return 1; fi
   local mirror src
   for mirror in "" "https://ghfast.top/" "https://gh-proxy.com/"; do
     src="${mirror}${1}"

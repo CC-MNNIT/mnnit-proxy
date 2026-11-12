@@ -26,6 +26,9 @@ curl -x http://edcguest:edcguest@172.31.100.25:3128 -fsSL \
 3. Enter your room IP → installer sets up everything
 4. After success, every app on your laptop goes through the college proxy automatically
 
+On laptops with more than one Ethernet adapter, pass `--interface en...` if the
+installer cannot identify the campus cable unambiguously.
+
 ### After install
 - `mnnit-proxy-update`  -  change hostel/IP, restore DHCP, toggle LAN auto-watch
 - Re-run `install.sh`  -  shows a menu (install / update / diagnose / uninstall)
@@ -81,7 +84,7 @@ If the installer doesn't work for your distro or network:
 Run `sudo bash install.sh --diagnose` first  -  it prints service state, config validity, interface/gateway info and per-proxy reachability.
 
 **"No NetworkManager connection profile found"**
-NetworkManager has no ethernet profile (common on fresh Ubuntu where the cable was never plugged in). Plug the cable in and re-run the installer  -  since v1.2.0 it creates a `mnnit-wired` profile automatically.
+NetworkManager has no Ethernet profile (common on fresh Ubuntu where the cable was never plugged in). v1.3.0 creates a dedicated `mnnit-campus-<interface>` profile and remembers its UUID; it no longer overwrites an unrelated wired profile.
 
 **"NetworkManager not found" (Ubuntu Server / minimal)**
 The installer checks your network backend up front:
@@ -91,7 +94,27 @@ The installer checks your network backend up front:
 
 If an existing netplan file already manages your interface, the installer never touches it  -  it prints the values to add manually instead.
 
-**Missing requirements** (curl/python3/iproute2/systemd) are checked before anything else and the installer exits with the exact install command for your distro.
+**Missing requirements** (curl/python3/iproute2/systemd/coreutils) are checked before anything else and the installer exits with the exact install command for your distro.
+
+**Arch/AUR: `unexpected EOF` from `aur.archlinux.org`**
+
+Some campus proxies accept `CONNECT aur.archlinux.org:443` but stall on
+`CONNECT <resolved-IP>:443`. v1.3.0 enables HTTP/TLS domain sniffing so TUN
+traffic retains its hostname. Verify with `paru -Si paru`; the mihomo log should
+show `aur.archlinux.org:443`, not only its IP address.
+
+**Works with the cable unplugged but fails when Wi-Fi is also enabled**
+
+NetworkManager may add a temporary `+20000` metric penalty to the campus route.
+v1.3.0 pins mihomo's outbound to the selected Ethernet interface and installs a
+specific `172.31.0.0/16` campus route; it never rewrites saved Wi-Fi profiles.
+The default TUN stack is `gvisor` for broad kernel/firewall compatibility. Use
+`--tun-stack system` if the kernel stack is known to work better on your host.
+
+**IPv6 warning:** the current campus setup proxies IPv4 TUN traffic. If a
+simultaneously connected Wi-Fi network supplies an IPv6 default route, disable
+Wi-Fi/IPv6 while using the campus proxy; diagnostics flag this condition rather
+than reporting a false all-clear.
 
 **Arch (AUR): "permission denied" reading /etc/mihomo/config.yaml**
 
@@ -119,6 +142,8 @@ sudo bash install.sh --uninstall
 | `--skip-ip` | Don't touch nmcli/network settings (CI, self-managed) |
 | `--no-tun` | Proxy port only, no TUN device (CI/VM friendly) |
 | `--no-lan-watch` | Don't install the LAN auto start/stop watcher |
+| `--interface IFACE` | Pin campus routing and mihomo outbound to this Ethernet interface |
+| `--tun-stack STACK` | Select `gvisor` (default), `system`, `mixed`, or `mips` |
 | `--uninstall` | Remove everything, restore DHCP |
 | `--diagnose` | Run diagnostics |
 
@@ -150,10 +175,13 @@ CI runs the same tests on every push: Ubuntu 22.04 + 24.04 (tinyproxy stands in 
 
 ## How it works
 
-**mihomo** creates a TUN virtual network interface. `auto-route` makes all traffic go through it. mihomo then checks the rules:
+**mihomo** creates a TUN virtual network interface. `auto-route` makes IPv4 traffic go through it. HTTP Host/TLS SNI sniffing preserves destination hostnames for campus proxy `CONNECT` requests. mihomo then checks the rules:
 - Private IPs (10/8, 172.16/12, 192.168/16) → DIRECT (bypasses proxy, stays on campus LAN)
 - Everything else → through the college proxy (fallback over 3 proxies)
 
-The `route-exclude-address` blocks in the TUN config prevent mihomo's own proxy connections from looping back into the TUN.
+The `route-exclude-address` blocks in the TUN config prevent mihomo's own proxy connections from looping back into the TUN. The managed wired profile also has a specific `172.31.0.0/16` route, so campus proxy and DNS traffic cannot accidentally leave over Wi-Fi.
 
-The LAN auto-watch script (`90-mihomo-lan`) monitors the college gateway (`172.31.*`): when you plug into campus LAN, mihomo starts; when you unplug, it stops  -  so hotspot at home just works.
+The LAN auto-watch script (`90-mihomo-lan`) monitors carrier plus a campus address (`172.31.*`): when you plug into campus LAN, mihomo starts; when you unplug, it stops  -  so hotspot at home just works.
+
+Downloaded mihomo binaries are accepted only after their SHA-256 digest matches
+GitHub's release metadata (or the hard-coded digest for the pinned fallback).

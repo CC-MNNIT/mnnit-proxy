@@ -100,6 +100,67 @@ t "backend: manual (mocked)"          test "$NET_BACKEND" = "manual"
 PATH="$OLD_PATH"
 rm -rf "$MOCKBIN"
 
+echo "── persisted interface state ──"
+STATE_DIR=$(mktemp -d)
+t "state round-trip" env MNNIT_STATE_FILE="$STATE_DIR/state" bash -c '
+  source "$1" 2>/dev/null
+  WIRED_IFACE=enp0s8
+  WIRED_CONN=12345678-1234-1234-1234-123456789abc
+  PROFILE_CREATED=true
+  PREVIOUS_CONN=abcdefab-1234-1234-1234-abcdefabcdef
+  save_state
+  WIRED_IFACE=""; WIRED_CONN=""; PROFILE_CREATED=false; PREVIOUS_CONN=""
+  load_state
+  [[ "$STATE_WIRED_IFACE" == enp0s8 &&
+     "$STATE_WIRED_CONN" == 12345678-1234-1234-1234-123456789abc &&
+     "$STATE_PROFILE_CREATED" == true &&
+     "$STATE_PREVIOUS_CONN" == abcdefab-1234-1234-1234-abcdefabcdef ]]
+' _ "$REPO/install.sh"
+t "state file mode 600" test "$(stat -c %a "$STATE_DIR/state")" = 600
+rm -rf "$STATE_DIR"
+
+echo "── DHCP restore fields ──"
+DHCP_BIN=$(mktemp -d)
+DHCP_CALLS="$DHCP_BIN/calls"
+cat > "$DHCP_BIN/nmcli" <<'MOCK'
+#!/bin/sh
+printf '%s\n' "$*" >> "$DHCP_CALLS"
+MOCK
+chmod +x "$DHCP_BIN/nmcli"
+export DHCP_CALLS
+PATH="$DHCP_BIN:$PATH" bash -c 'source "$1" 2>/dev/null; reset_nm_profile_to_dhcp test-uuid' _ "$REPO/install.sh"
+t "DHCP reset clears addresses" grep -q "ipv4.addresses" "$DHCP_CALLS"
+t "DHCP reset clears gateway"   grep -q "ipv4.gateway" "$DHCP_CALLS"
+t "DHCP reset clears DNS"       grep -q "ipv4.dns" "$DHCP_CALLS"
+t "DHCP reset clears routes"    grep -q "ipv4.routes" "$DHCP_CALLS"
+unset DHCP_CALLS
+rm -rf "$DHCP_BIN"
+
+echo "── interface discovery is read-only ──"
+TEST_ETH=$(find /sys/class/net -maxdepth 1 -type l -printf '%f\n' 2>/dev/null | grep -E '^(en|eth)' | head -1 || true)
+if [[ -n "$TEST_ETH" ]]; then
+  DISC_BIN=$(mktemp -d)
+  DISC_CALLS="$DISC_BIN/calls"; export DISC_CALLS
+  cat > "$DISC_BIN/nmcli" <<'MOCK'
+#!/bin/sh
+printf '%s\n' "$*" >> "$DISC_CALLS"
+if [ "$1 $2 $3" = "-g GENERAL.STATE device" ]; then echo "30 (disconnected)"; fi
+exit 0
+MOCK
+  chmod +x "$DISC_BIN/nmcli"
+  PATH="$DISC_BIN:$PATH" bash -c '
+    source "$1" 2>/dev/null
+    NET_BACKEND=networkmanager
+    FLAG_INTERFACE="$2"
+    detect_iface >/dev/null
+  ' _ "$REPO/install.sh" "$TEST_ETH"
+  tf "detect does not create a profile" grep -q "con add" "$DISC_CALLS"
+  unset DISC_CALLS
+  rm -rf "$DISC_BIN"
+else
+  echo "  - no Ethernet interface in test environment; skipping"
+fi
+
 echo "── netplan config writer ──"
 WIRED_IFACE="enp0s8"
 SELECTED_HOSTEL_IP="172.31.64.135"
@@ -110,6 +171,7 @@ netplan_yaml > "$NP_DIR/99-mnnit-proxy.yaml"
 t "netplan yaml has iface"        grep -q "^    enp0s8:" "$NP_DIR/99-mnnit-proxy.yaml"
 t "netplan yaml has ip/prefix"    grep -q "172.31.64.135/23" "$NP_DIR/99-mnnit-proxy.yaml"
 t "netplan yaml has gateway"      grep -q "via: 172.31.64.1" "$NP_DIR/99-mnnit-proxy.yaml"
+t "netplan yaml has campus route" grep -q "to: 172.31.0.0/16" "$NP_DIR/99-mnnit-proxy.yaml"
 t "netplan yaml has all dns"      grep -q "172.31.100.6 172.31.100.7 172.31.100.8" "$NP_DIR/99-mnnit-proxy.yaml"
 tf "netplan yaml no placeholders" grep -q '{{' "$NP_DIR/99-mnnit-proxy.yaml"
 rm -rf "$NP_DIR"
@@ -164,7 +226,10 @@ rm -rf "$OWBIN" "$OWN_DIR"
 
 echo "── --help completeness ──"
 t "install.sh --help shows last flag (--diagnose)"  bash -c "bash '$REPO/install.sh' --help | grep -q -- '--diagnose'"
-t "update.sh --help shows last flag (--yes)"        bash -c "bash '$REPO/update.sh' --help | grep -q -- '--yes'"
+t "install.sh --help shows --tun-stack"             bash -c "bash '$REPO/install.sh' --help | grep -q -- '--tun-stack'"
+t "update.sh --help shows --tun-stack"              bash -c "bash '$REPO/update.sh' --help | grep -q -- '--tun-stack'"
+t "install rejects invalid --tun-stack"             bash -c "bash '$REPO/install.sh' --tun-stack nope 2>&1 | grep -q 'Invalid --tun-stack'"
+t "updater rejects invalid --tun-stack"             bash -c "bash '$REPO/update.sh' --tun-stack nope 2>&1 | grep -q 'Invalid --tun-stack'"
 
 echo "── hostel resolution ──"
 TSV="$REPO/hostels.tsv"
@@ -192,17 +257,18 @@ t "--gateway overrides"        test "$SELECTED_HOSTEL_GW" = "172.31.137.1"
 unset FLAG_GATEWAY
 
 echo "── campus-link start decision ──"
-if campus_link; then
-  t "campus address + carrier -> start" should_start_mihomo
-else
-  tf "no live campus address -> don't start" should_start_mihomo
-fi
+campus_link() { return 0; }
+t "campus address + carrier -> start" should_start_mihomo
+campus_link() { return 1; }
+tf "no live campus address -> don't start" should_start_mihomo
 
 echo "── tun stack validation ──"
 for stack in system gvisor mixed mips; do
   t "stack accepted: $stack" valid_tun_stack "$stack"
 done
 tf "invalid stack rejected" valid_tun_stack nope
+t "pinned amd64 digest shape" bash -c '[[ "$1" =~ ^[0-9a-f]{64}$ ]]' _ "$MIHOMO_PINNED_AMD64_SHA256"
+t "pinned arm64 digest shape" bash -c '[[ "$1" =~ ^[0-9a-f]{64}$ ]]' _ "$MIHOMO_PINNED_ARM64_SHA256"
 
 echo "── config rendering ──"
 # PROXY_PORT/PROXY_USER/PROXY_PASS are already set (readonly) by sourcing install.sh

@@ -96,6 +96,14 @@ t "config has college proxy"   grep -q "server: 172.31.100.27" /etc/mihomo/confi
 t "config tun disabled"        grep -q "enable: false" /etc/mihomo/config.yaml
 t "config chmod 600"           test "$(stat -c %a /etc/mihomo/config.yaml 2>/dev/null || stat -f %Lp /etc/mihomo/config.yaml)" = "600"
 t "mihomo -t validates config" mihomo -t -d /etc/mihomo
+CFG_BEFORE=$(sha256sum /etc/mihomo/config.yaml | awk '{print $1}')
+if bash -c "source '$REPO/install.sh' 2>/dev/null; install_rendered_config 'broken: ['" >/dev/null 2>&1; then
+  echo "  ✗ invalid staged config was accepted"; FAIL=$((FAIL+1))
+else
+  echo "  ✓ invalid staged config rejected"; PASS=$((PASS+1))
+fi
+CFG_AFTER=$(sha256sum /etc/mihomo/config.yaml | awk '{print $1}')
+t "invalid config leaves live config unchanged" test "$CFG_BEFORE" = "$CFG_AFTER"
 # Start decision: runners have no campus gateway, so the installer should
 # leave mihomo stopped (correct no-phantom behavior). Assert the right one.
 if grep -q "mihomo left stopped" "$UNATTENDED_OUT"; then
@@ -165,6 +173,11 @@ if [[ -n "$ORIG_ROUTES" ]]; then
 fi
 # bring mihomo back for the update.sh tests
 systemctl start mihomo 2>/dev/null || true
+# update.sh now reconciles against a real campus address rather than merely
+# trusting service state, so recreate the dummy campus link for this section.
+ip link add dummy0 type dummy 2>/dev/null || true
+ip addr add 172.31.99.1/24 dev dummy0 2>/dev/null || true
+ip link set dummy0 up
 
 echo "── update.sh actions ──"
 t "status action exits 0"    bash "$REPO/update.sh" --action status
@@ -173,6 +186,7 @@ t "change-ip regenerates"    bash "$REPO/update.sh" --action change-ip \
                                --ip 172.31.144.50 --yes --force
 t "config now has PG proxy"  grep -q "server: 172.31.100.25" /etc/mihomo/config.yaml
 t "mihomo still active"      systemctl is-active mihomo
+ip link del dummy0 2>/dev/null || true
 
 echo "── no-NM honest install path (backend forced to manual) ──"
 # Proves: install succeeds without NM, no dead dispatcher file is installed,
@@ -229,6 +243,18 @@ t "netplan file written"                    test -f "$NPBIN/netplan-dir/99-mnnit
 t "netplan file chmod 600"                  test "$(stat -c %a "$NPBIN/netplan-dir/99-mnnit-proxy.yaml" 2>/dev/null)" = "600"
 grep -q "172.31.64.135/23" "$NPBIN/netplan-dir/99-mnnit-proxy.yaml" 2>/dev/null && { echo "  ✓ netplan yaml has room IP"; PASS=$((PASS+1)); } || { echo "  ✗ netplan yaml missing room IP"; FAIL=$((FAIL+1)); }
 t "netplan apply was invoked"               test -f /tmp/mnnit-test-netplan-applied
+# Our own file is replaceable on updates (it must not trip the foreign-file guard).
+echo "stale: true" > "$NPBIN/netplan-dir/99-mnnit-proxy.yaml"
+NETPLAN_DIR="$NPBIN/netplan-dir" PATH="$NPBIN:$PATH" bash -c "
+  source '$REPO/install.sh' 2>/dev/null
+  WIRED_IFACE=entest0
+  SELECTED_HOSTEL_IP=172.31.64.135
+  SELECTED_HOSTEL_PREFIX=23
+  SELECTED_HOSTEL_GW=172.31.64.1
+  NETPLAN_FILE='$NPBIN/netplan-dir/99-mnnit-proxy.yaml'
+  apply_netplan >/dev/null 2>&1
+" && { echo "  ✓ own netplan file is updateable"; PASS=$((PASS+1)); } || { echo "  ✗ own netplan update failed"; FAIL=$((FAIL+1)); }
+t "own netplan file was replaced" grep -q "172.31.64.135/23" "$NPBIN/netplan-dir/99-mnnit-proxy.yaml"
 # conflict guard: pre-existing file managing the iface -> no overwrite
 touch "$NPBIN/netplan-dir/00-existing.yaml"
 echo "ethernets: {entest0: {dhcp4: true}}" > "$NPBIN/netplan-dir/00-existing.yaml"

@@ -19,13 +19,15 @@
 #   --tun-stack STACK  system|gvisor|mixed|mips (preserves current if omitted)
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.2.2"
+readonly APP_VERSION="1.3.0"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
 readonly DNS_SRV="172.31.100.6, 172.31.100.7, 172.31.100.8"
 readonly DNS_SRV_LIST="172.31.100.6,172.31.100.7,172.31.100.8"
 readonly DEFAULT_TUN_STACK="gvisor"
+readonly CAMPUS_ROUTE="172.31.0.0/16"
+readonly STATE_FILE="${MNNIT_STATE_FILE:-/opt/mnnit-proxy/state}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || pwd)"
 if [[ -f "$SCRIPT_DIR/hostels.tsv" && -f "$SCRIPT_DIR/config.template.yaml" ]]; then
@@ -48,6 +50,7 @@ SELECTED_HOSTEL_IP=""
 SELECTED_HOSTEL_GW=""
 SELECTED_HOSTEL_PREFIX=""
 SELECTED_HOSTEL_PROXIES=""
+SELECTED_HOSTEL_FLOORWISE=false
 
 FLAG_HOSTEL=""
 FLAG_IP=""
@@ -57,6 +60,14 @@ FLAG_YES=false
 FLAG_INTERFACE=""
 FLAG_TUN_STACK=""
 ACTION=""
+PROFILE_CREATED=false
+PREVIOUS_CONN=""
+STATE_WIRED_IFACE=""
+STATE_WIRED_CONN=""
+STATE_PROFILE_CREATED=false
+STATE_PREVIOUS_CONN=""
+CONFIG_HAD_PREVIOUS=false
+readonly CONFIG_BACKUP="/etc/mihomo/config.yaml.previous"
 
 if [[ -t 1 ]]; then
   R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; B=$'\e[1m'; N=$'\e[0m'
@@ -137,6 +148,8 @@ network:
       routes:
         - to: default
           via: $SELECTED_HOSTEL_GW
+        - to: $CAMPUS_ROUTE
+          via: $SELECTED_HOSTEL_GW
       nameservers:
         addresses: [${DNS_SRV_LIST//,/ }]
 EOF
@@ -146,7 +159,16 @@ EOF
 netplan_iface_conflicts() {
   local base_dir
   base_dir="$(dirname "$NETPLAN_FILE")"
-  grep -rlE "(^|[^-[:alnum:]])$WIRED_IFACE:" "$base_dir"/*.yaml 2>/dev/null | head -1
+  local file
+  for file in "$base_dir"/*.yaml; do
+    [[ -f "$file" ]] || continue
+    [[ "$file" == "$NETPLAN_FILE" ]] && continue
+    if grep -Fq "$WIRED_IFACE:" "$file" 2>/dev/null; then
+      echo "$file"
+      return 0
+    fi
+  done
+  return 1
 }
 
 print_manual_ip_instructions() {
@@ -167,6 +189,8 @@ print_manual_ip_instructions() {
   │       routes:
   │         - to: default
   │           via: $SELECTED_HOSTEL_GW
+  │         - to: $CAMPUS_ROUTE
+  │           via: $SELECTED_HOSTEL_GW
   │       nameservers:
   │         addresses: [${DNS_SRV_LIST//,/ }]
   │ NETPLAN
@@ -186,7 +210,12 @@ apply_netplan() {
     warn "Existing netplan file already configures $WIRED_IFACE: $(basename "$conflict")"
     warn "Not touching it  -  add these values there manually:"
     netplan_yaml | sed 's/^/    /'
-    return 0
+    return 1
+  fi
+  local backup=""
+  if [[ -f "$NETPLAN_FILE" ]]; then
+    backup="${NETPLAN_FILE}.previous"
+    cp -a "$NETPLAN_FILE" "$backup"
   fi
   netplan_yaml > "$NETPLAN_FILE.tmp"
   mv "$NETPLAN_FILE.tmp" "$NETPLAN_FILE"
@@ -198,11 +227,13 @@ apply_netplan() {
       return 0
     fi
     warn "netplan apply ran but the IP is not on $WIRED_IFACE yet"
-    return 0
+    if [[ -n "$backup" ]]; then cp -a "$backup" "$NETPLAN_FILE"; else rm -f "$NETPLAN_FILE"; fi
+    return 1
   fi
-  rm -f "$NETPLAN_FILE"
+  if [[ -n "$backup" ]]; then cp -a "$backup" "$NETPLAN_FILE"; else rm -f "$NETPLAN_FILE"; fi
   warn "netplan apply failed  -  our config was rolled back. Instructions:"
   print_manual_ip_instructions
+  return 1
 }
 
 # ---- preflight (updater needs less, but fail clearly) ----
@@ -222,6 +253,40 @@ valid_tun_stack() {
     system|gvisor|mixed|mips) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+load_state() {
+  STATE_WIRED_IFACE=""
+  STATE_WIRED_CONN=""
+  STATE_PROFILE_CREATED=false
+  STATE_PREVIOUS_CONN=""
+  [[ -f "$STATE_FILE" ]] || return 0
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      WIRED_IFACE)      [[ "$value" =~ ^[[:alnum:]_.:-]+$ ]] && STATE_WIRED_IFACE="$value" ;;
+      WIRED_CONN)       [[ "$value" =~ ^[[:xdigit:]-]+$ ]] && STATE_WIRED_CONN="$value" ;;
+      PROFILE_CREATED)  [[ "$value" == true || "$value" == false ]] && STATE_PROFILE_CREATED="$value" ;;
+      PREVIOUS_CONN)    [[ -z "$value" || "$value" =~ ^[[:xdigit:]-]+$ ]] && STATE_PREVIOUS_CONN="$value" ;;
+    esac
+  done < "$STATE_FILE"
+}
+
+save_state() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  local tmp="${STATE_FILE}.tmp"
+  {
+    printf 'WIRED_IFACE=%s\n' "$WIRED_IFACE"
+    printf 'WIRED_CONN=%s\n' "$WIRED_CONN"
+    printf 'PROFILE_CREATED=%s\n' "$PROFILE_CREATED"
+    printf 'PREVIOUS_CONN=%s\n' "$PREVIOUS_CONN"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+nm_connection_exists() {
+  [[ -n "${1:-}" ]] && nmcli -g connection.uuid con show "$1" &>/dev/null
 }
 
 find_wired_connection() {
@@ -248,14 +313,63 @@ find_wired_connection() {
 }
 
 ensure_wired_connection() {
-  [[ -n "$WIRED_CONN" ]] && return 0
-  local name="mnnit-wired-$WIRED_IFACE"
-  if nmcli con add type ethernet ifname "$WIRED_IFACE" con-name "$name" &>/dev/null; then
-    find_wired_connection || true
-    if [[ -n "$WIRED_CONN" ]]; then
-      ok "Created NM profile '$name'"
-      return 0
+  load_state
+  if [[ "$STATE_WIRED_IFACE" == "$WIRED_IFACE" ]] && nm_connection_exists "$STATE_WIRED_CONN"; then
+    WIRED_CONN="$STATE_WIRED_CONN"
+    PROFILE_CREATED="$STATE_PROFILE_CREATED"
+    PREVIOUS_CONN="$STATE_PREVIOUS_CONN"
+    return 0
+  fi
+  if [[ -n "$STATE_WIRED_IFACE" && "$STATE_WIRED_IFACE" != "$WIRED_IFACE" \
+        && "$STATE_PROFILE_CREATED" == true ]] && nm_connection_exists "$STATE_WIRED_CONN"; then
+    nmcli con down "$STATE_WIRED_CONN" 2>/dev/null || true
+    nmcli con delete "$STATE_WIRED_CONN" >/dev/null
+  fi
+
+  PROFILE_CREATED=false
+  PREVIOUS_CONN=""
+
+  local current_conn="$WIRED_CONN" current_name="" name="mnnit-campus-$WIRED_IFACE"
+  if [[ -n "$current_conn" ]]; then
+    current_name=$(nmcli -g connection.id con show "$current_conn" 2>/dev/null | head -1 || true)
+  fi
+  if [[ "$current_name" == mnnit-wired* || "$current_name" == mnnit-campus-* ]]; then
+    [[ "$current_name" == mnnit-campus-* ]] && PROFILE_CREATED=true
+    PREVIOUS_CONN=""
+    save_state
+    return 0
+  fi
+
+  PREVIOUS_CONN="$current_conn"
+  WIRED_CONN=""
+  local uuid type ifname profile_name
+  while IFS=: read -r uuid type; do
+    [[ "$type" == "802-3-ethernet" || "$type" == "ethernet" ]] || continue
+    ifname=$(nmcli -g connection.interface-name con show "$uuid" 2>/dev/null | head -1 || true)
+    profile_name=$(nmcli -g connection.id con show "$uuid" 2>/dev/null | head -1 || true)
+    if [[ "$ifname" == "$WIRED_IFACE" && "$profile_name" == "$name" ]]; then
+      WIRED_CONN="$uuid"
+      PROFILE_CREATED=true
+      break
     fi
+  done < <(nmcli -t -f UUID,TYPE con show 2>/dev/null || true)
+
+  if [[ -z "$WIRED_CONN" ]] && nmcli con add type ethernet ifname "$WIRED_IFACE" con-name "$name" &>/dev/null; then
+    while IFS=: read -r uuid type; do
+      [[ "$type" == "802-3-ethernet" || "$type" == "ethernet" ]] || continue
+      ifname=$(nmcli -g connection.interface-name con show "$uuid" 2>/dev/null | head -1 || true)
+      profile_name=$(nmcli -g connection.id con show "$uuid" 2>/dev/null | head -1 || true)
+      if [[ "$ifname" == "$WIRED_IFACE" && "$profile_name" == "$name" ]]; then
+        WIRED_CONN="$uuid"
+        break
+      fi
+    done < <(nmcli -t -f UUID,TYPE con show 2>/dev/null || true)
+    PROFILE_CREATED=true
+  fi
+  if [[ -n "$WIRED_CONN" ]]; then
+    save_state
+    ok "Using managed NM profile '$name'"
+    return 0
   fi
   warn "Could not create a NetworkManager profile for $WIRED_IFACE."
   return 1
@@ -280,15 +394,19 @@ detect_iface() {
       || { warn "Interface '$FLAG_INTERFACE' is not Ethernet."; return 1; }
     iface="$FLAG_INTERFACE"
   else
+    load_state
+    if [[ -n "$STATE_WIRED_IFACE" && -d "/sys/class/net/$STATE_WIRED_IFACE" ]]; then
+      iface="$STATE_WIRED_IFACE"
+    fi
     for i in "${ifaces[@]}"; do
       if ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4}' | grep -q '^172\.31\.'; then
         campus_ifaces+=("$i")
       fi
       [[ "$(cat "/sys/class/net/$i/carrier" 2>/dev/null)" == "1" ]] && carrier_ifaces+=("$i")
     done
-    if [[ ${#campus_ifaces[@]} -eq 1 ]]; then
+    if [[ -z "$iface" && ${#campus_ifaces[@]} -eq 1 ]]; then
       iface="${campus_ifaces[0]}"
-    elif [[ ${#carrier_ifaces[@]} -eq 1 ]]; then
+    elif [[ -z "$iface" && ${#carrier_ifaces[@]} -eq 1 ]]; then
       iface="${carrier_ifaces[0]}"
     fi
     if [[ -z "$iface" && "$NET_BACKEND" == "networkmanager" ]]; then
@@ -374,6 +492,7 @@ resolve_hostel_by_name() {
   SELECTED_HOSTEL_GW="${HOSTEL_GWS[idx]}"
   SELECTED_HOSTEL_PREFIX="${HOSTEL_PREFIXES[idx]}"
   SELECTED_HOSTEL_PROXIES="${HOSTEL_PROXIES[idx]}"
+  [[ "${HOSTEL_PREFIXES[idx]}" == "floorwise" ]] && SELECTED_HOSTEL_FLOORWISE=true || SELECTED_HOSTEL_FLOORWISE=false
   if ! in_range "$SELECTED_HOSTEL_IP" "${HOSTEL_FROMS[idx]}" "${HOSTEL_TOS[idx]}"; then
     if [[ "$FLAG_FORCE" != true ]]; then
       die "$SELECTED_HOSTEL_IP is outside ${SELECTED_HOSTEL_NAME}'s documented range (${HOSTEL_FROMS[idx]}–${HOSTEL_TOS[idx]}). Use --force to override."
@@ -429,7 +548,17 @@ summary_edit_loop() {
         while :; do
           local ip
           ip=$(ask "Enter your room IP" "$SELECTED_HOSTEL_IP")
-          if valid_ip "$ip"; then SELECTED_HOSTEL_IP="$ip"; break; fi
+          if valid_ip "$ip"; then
+            SELECTED_HOSTEL_IP="$ip"
+            if [[ "$SELECTED_HOSTEL_FLOORWISE" == true ]]; then
+              local IFS=. a b c d
+              read -r a b c d <<< "$ip"
+              SELECTED_HOSTEL_GW="${a}.${b}.${c}.1"
+              SELECTED_HOSTEL_PREFIX="24"
+              warn "Floor-wise gateway recalculated as $SELECTED_HOSTEL_GW  -  verify it in the summary."
+            fi
+            break
+          fi
           warn "Not a valid IP address"
         done
         ;;
@@ -499,6 +628,7 @@ pick_hostel() {
   SELECTED_HOSTEL_GW="${HOSTEL_GWS[idx]}"
   SELECTED_HOSTEL_PREFIX="${HOSTEL_PREFIXES[idx]}"
   SELECTED_HOSTEL_PROXIES="${HOSTEL_PROXIES[idx]}"
+  [[ "${HOSTEL_PREFIXES[idx]}" == "floorwise" ]] && SELECTED_HOSTEL_FLOORWISE=true || SELECTED_HOSTEL_FLOORWISE=false
   local ip_from="${HOSTEL_FROMS[idx]}" ip_to="${HOSTEL_TOS[idx]}" pdf="${HOSTEL_PDFS[idx]}"
 
   echo ""
@@ -558,16 +688,23 @@ apply_ip() {
   conn_name=$(nmcli -g connection.id con show "$WIRED_CONN" 2>/dev/null | head -1 || true)
   log "Applying static IP on '${conn_name:-$WIRED_CONN}'..."
   nmcli con mod "$WIRED_CONN" \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 100 \
     ipv4.method manual \
     ipv4.addresses "${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX}" \
     ipv4.gateway "$SELECTED_HOSTEL_GW" \
-    ipv4.dns "$DNS_SRV_LIST"
+    ipv4.dns "$DNS_SRV_LIST" \
+    ipv4.routes "${CAMPUS_ROUTE} ${SELECTED_HOSTEL_GW}"
   local carrier
   carrier=$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null || echo 0)
   if [[ "$carrier" == "1" ]]; then
     nmcli con down "$WIRED_CONN" 2>/dev/null >/dev/null || true
-    nmcli con up "$WIRED_CONN" || warn "Connection activation failed"
-    ok "Static IP applied"
+    if nmcli con up "$WIRED_CONN"; then
+      ok "Static IP applied"
+    else
+      fail "Connection activation failed  -  check the cable/IP settings"
+      return 1
+    fi
   else
     # No cable: never activate - avoids phantom "activated" state in NM.
     nmcli con down "$WIRED_CONN" 2>/dev/null >/dev/null || true
@@ -593,6 +730,43 @@ fix_config_ownership() {
   else
     warn "Could not adjust config ownership for '$srv_user'. If mihomo cannot read the config:"
     warn "  sudo chown root:$srv_group /etc/mihomo/config.yaml && sudo chmod 640 /etc/mihomo/config.yaml"
+  fi
+}
+
+install_rendered_config() {
+  local rendered="$1" stage test_dir
+  mkdir -p /etc/mihomo
+  stage=$(mktemp /etc/mihomo/.config.yaml.XXXXXX)
+  test_dir=$(mktemp -d)
+  printf '%s\n' "$rendered" > "$stage"
+  chmod 600 "$stage"
+  cp "$stage" "$test_dir/config.yaml"
+  chmod 600 "$test_dir/config.yaml"
+  if ! mihomo -t -d "$test_dir" >/dev/null 2>&1; then
+    mihomo -t -d "$test_dir" 2>&1 || true
+    rm -f "$stage"
+    rm -rf "$test_dir"
+    die "Config validation failed  -  existing config was not changed"
+  fi
+  rm -rf "$test_dir"
+  CONFIG_HAD_PREVIOUS=false
+  rm -f "$CONFIG_BACKUP"
+  if [[ -f /etc/mihomo/config.yaml ]]; then
+    cp -a /etc/mihomo/config.yaml "$CONFIG_BACKUP"
+    CONFIG_HAD_PREVIOUS=true
+  fi
+  mv "$stage" /etc/mihomo/config.yaml
+  chmod 600 /etc/mihomo/config.yaml
+  fix_config_ownership
+}
+
+restore_previous_config() {
+  if [[ "$CONFIG_HAD_PREVIOUS" == true && -f "$CONFIG_BACKUP" ]]; then
+    cp -a "$CONFIG_BACKUP" /etc/mihomo/config.yaml
+    fix_config_ownership
+    warn "Restored the previous mihomo config"
+  elif [[ "$CONFIG_HAD_PREVIOUS" != true ]]; then
+    rm -f /etc/mihomo/config.yaml
   fi
 }
 
@@ -628,7 +802,6 @@ gen_config() {
     || die "Invalid TUN stack '$tun_stack' (use system|gvisor|mixed|mips)"
   local outbound_iface="$WIRED_IFACE"
 
-  mkdir -p /etc/mihomo
   local rendered
   rendered=$(python3 - "$proxy_entries" "$proxy_names" "$tun_enable" \
     "$tun_stack" "$outbound_iface" "$TEMPLATE" <<'PYEOF'
@@ -653,15 +826,7 @@ if "{{" in t:
 sys.stdout.write(t)
 PYEOF
   ) || die "Failed to render config"
-  # Atomic write - an interrupted redirect would leave a truncated config
-  printf '%s\n' "$rendered" > /etc/mihomo/config.yaml.tmp
-  mv /etc/mihomo/config.yaml.tmp /etc/mihomo/config.yaml
-  chmod 600 /etc/mihomo/config.yaml
-  fix_config_ownership
-  mihomo -t -d /etc/mihomo >/dev/null 2>&1 || {
-    mihomo -t -d /etc/mihomo 2>&1 || true
-    die "Config validation failed"
-  }
+  install_rendered_config "$rendered"
   ok "Config updated (tun: $tun_enable)"
 }
 
@@ -682,10 +847,20 @@ campus_link() {
 reconcile_mihomo() {
   if campus_link; then
     if systemctl is-active --quiet mihomo 2>/dev/null; then
-      systemctl restart mihomo
+      if ! systemctl restart mihomo; then
+        fail "mihomo rejected the new config at runtime"
+        restore_previous_config
+        systemctl restart mihomo 2>/dev/null || true
+        return 1
+      fi
       ok "mihomo restarted with the new config"
     else
-      systemctl start mihomo
+      if ! systemctl start mihomo; then
+        fail "mihomo could not start with the new config"
+        restore_previous_config
+        systemctl start mihomo 2>/dev/null || true
+        return 1
+      fi
       ok "mihomo started on campus link"
     fi
   else
@@ -714,6 +889,11 @@ show_status() {
       warn "Not on campus (or cable unplugged)"
     fi
   fi
+  local ipv6_default
+  ipv6_default=$(ip -6 route show default 2>/dev/null | head -1 || true)
+  if [[ -n "$ipv6_default" && "$ipv6_default" != *" dev Meta "* ]]; then
+    warn "IPv6 can bypass the proxy: $ipv6_default"
+  fi
   echo ""
   if [[ -f /etc/mihomo/config.yaml ]]; then
     echo -e "${B}Proxies in config:${N}"
@@ -723,16 +903,55 @@ show_status() {
   echo -e "${Y}Note: ping & voice calls don't work through the proxy  -  expected.${N}"
 }
 
+reset_nm_profile_to_dhcp() {
+  local conn="$1"
+  nmcli con mod "$conn" \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 0 \
+    ipv4.method auto \
+    ipv4.addresses "" \
+    ipv4.gateway "" \
+    ipv4.dns "" \
+    ipv4.routes "" \
+    ipv4.never-default no
+}
+
+restore_nm_network() {
+  load_state
+  local conn="${STATE_WIRED_CONN:-$WIRED_CONN}"
+  local created="$STATE_PROFILE_CREATED" previous="$STATE_PREVIOUS_CONN"
+  if nm_connection_exists "$conn"; then
+    nmcli con down "$conn" 2>/dev/null || true
+    if [[ "$created" == true && -n "$previous" ]]; then
+      nmcli con delete "$conn" >/dev/null
+      ok "Removed the managed campus profile"
+    else
+      reset_nm_profile_to_dhcp "$conn"
+      ok "DHCP restored (campus DNS and routes cleared)"
+    fi
+  fi
+  if nm_connection_exists "$previous"; then
+    local previous_iface
+    previous_iface=$(nmcli -g connection.interface-name con show "$previous" 2>/dev/null | head -1 || true)
+    if [[ -n "$previous_iface" && "$(cat "/sys/class/net/$previous_iface/carrier" 2>/dev/null)" == "1" ]]; then
+      nmcli con up "$previous" 2>/dev/null || true
+    fi
+  elif nm_connection_exists "$conn" \
+       && [[ "$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null)" == "1" ]]; then
+    nmcli con up "$conn" 2>/dev/null || true
+  fi
+  rm -f "$STATE_FILE"
+}
+
 restore_dhcp() {
   log "Restoring DHCP and stopping proxy..."
   detect_iface || true
-  if [[ -n "$WIRED_CONN" ]]; then
-    nmcli con mod "$WIRED_CONN" ipv4.method auto ipv4.addresses "" ipv4.gateway "" 2>/dev/null || true
-    nmcli con up "$WIRED_CONN" 2>/dev/null || true
-    ok "DHCP restored"
+  if [[ "$NET_BACKEND" == "networkmanager" ]]; then
+    restore_nm_network
   elif [[ -f "$NETPLAN_FILE" ]]; then
     # We wrote a netplan file - remove it and let the existing config take over
     rm -f "$NETPLAN_FILE"
+    rm -f "${NETPLAN_FILE}.previous"
     netplan apply 2>/dev/null || true
     ok "DHCP restored (netplan static IP removed)"
   else
@@ -740,7 +959,7 @@ restore_dhcp() {
   fi
   systemctl stop mihomo 2>/dev/null || true
   ok "mihomo stopped"
-  echo -e "${Y}Note: mihomo restarts automatically when you plug back into campus LAN (if LAN watcher is installed).${N}"
+  echo -e "${Y}Run mnnit-proxy-update to restore your campus IP when you return.${N}"
 }
 
 toggle_watcher() {

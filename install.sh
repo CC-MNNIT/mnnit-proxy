@@ -23,14 +23,18 @@
 #   --diagnose         run diagnostics
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.2.2"
+readonly APP_VERSION="1.3.0"
 readonly PROXY_PORT=3128
 readonly PROXY_USER="edcguest"
 readonly PROXY_PASS="edcguest"
 readonly DNS_SRV="172.31.100.6, 172.31.100.7, 172.31.100.8"
 readonly DNS_SRV_LIST="172.31.100.6,172.31.100.7,172.31.100.8"
 readonly MIHOMO_PINNED="v1.19.30"   # fallback when GitHub API is unavailable
+readonly MIHOMO_PINNED_AMD64_SHA256="cf06ce2c7d1421bdbda14ee4a5b6046672dc35ebf8eecd8e77504ec3c0ed9a84"
+readonly MIHOMO_PINNED_ARM64_SHA256="58896873736d28628f66de3677c8654fa0f180662523148e136cff4f6e890069"
 readonly DEFAULT_TUN_STACK="gvisor"
+readonly CAMPUS_ROUTE="172.31.0.0/16"
+readonly STATE_FILE="${MNNIT_STATE_FILE:-/opt/mnnit-proxy/state}"
 
 # Data files  -  local dir first, then fallback to downloaded (pipe mode)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || pwd)"
@@ -47,7 +51,16 @@ SELECTED_HOSTEL_IP=""
 SELECTED_HOSTEL_GW=""
 SELECTED_HOSTEL_PREFIX=""
 SELECTED_HOSTEL_PROXIES=""
+SELECTED_HOSTEL_FLOORWISE=false
 TMPDIR_DATA=""
+PROFILE_CREATED=false
+PREVIOUS_CONN=""
+STATE_WIRED_IFACE=""
+STATE_WIRED_CONN=""
+STATE_PROFILE_CREATED=false
+STATE_PREVIOUS_CONN=""
+CONFIG_HAD_PREVIOUS=false
+readonly CONFIG_BACKUP="/etc/mihomo/config.yaml.previous"
 
 # ---- flags ----
 FLAG_HOSTEL=""
@@ -141,6 +154,13 @@ download() {
   return 1
 }
 
+fetch_release_metadata() {
+  local out="$1"
+  curl -fsSL --connect-timeout 8 --max-time 30 \
+    "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" \
+    -o "$out" 2>/dev/null
+}
+
 # ---- bootstrap internet (try direct, then campus proxy) ----
 boot_internet() {
   log "Checking internet connectivity..."
@@ -230,16 +250,16 @@ detect_backend() {
 preflight() {
   log "Checking system requirements..."
   local missing=() cmd
-  for cmd in curl python3 ip systemctl; do
+  for cmd in curl python3 ip systemctl sha256sum; do
     command -v "$cmd" &>/dev/null || missing+=("$cmd")
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     fail "Missing required tools: ${missing[*]}"
     local hint
     case "$DISTRO_FAMILY" in
-      arch)   hint="sudo pacman -S curl python iproute2 systemd" ;;
-      debian) hint="sudo apt install curl python3 iproute2" ;;
-      rhel)   hint="sudo dnf install curl python3 iproute" ;;
+      arch)   hint="sudo pacman -S curl python iproute2 systemd coreutils" ;;
+      debian) hint="sudo apt install curl python3 iproute2 coreutils" ;;
+      rhel)   hint="sudo dnf install curl python3 iproute coreutils" ;;
       *)      hint="install curl, python3 and iproute2 with your package manager" ;;
     esac
     die "Install them first, then re-run:  $hint"
@@ -330,22 +350,40 @@ install_mihomo_arch() {
 }
 
 install_mihomo_binary() {
-  local arch
+  local arch pinned_digest
   case "$(uname -m)" in
-    x86_64)  arch="amd64" ;;
-    aarch64) arch="arm64" ;;
+    x86_64)  arch="amd64"; pinned_digest="$MIHOMO_PINNED_AMD64_SHA256" ;;
+    aarch64) arch="arm64"; pinned_digest="$MIHOMO_PINNED_ARM64_SHA256" ;;
     *) die "Unsupported architecture: $(uname -m)" ;;
   esac
   log "Downloading latest mihomo binary ($arch)..."
-  local tmpd tag=""
+  local tmpd tag="" digest="" release_meta=""
   tmpd="$(mktemp -d)"
-  if download "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" "$tmpd/release.json" \
-     && grep -q '"tag_name"' "$tmpd/release.json"; then
-    tag=$(grep '"tag_name"' "$tmpd/release.json" | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+  # Release metadata is security-sensitive: fetch it directly from GitHub,
+  # never through a third-party mirror. Asset downloads may use mirrors only
+  # after their GitHub-provided SHA-256 digest is known.
+  if fetch_release_metadata "$tmpd/release.json"; then
+    release_meta=$(python3 - "$tmpd/release.json" "$arch" <<'PY'
+import json, sys
+path, arch = sys.argv[1:]
+with open(path) as f:
+    release = json.load(f)
+tag = release.get("tag_name", "")
+name = f"mihomo-linux-{arch}-{tag}.gz"
+asset = next((a for a in release.get("assets", []) if a.get("name") == name), {})
+digest = asset.get("digest", "")
+if digest.startswith("sha256:"):
+    digest = digest.removeprefix("sha256:")
+if tag and len(digest) == 64:
+    print(f"{tag}|{digest}")
+PY
+    ) || true
+    IFS='|' read -r tag digest <<< "$release_meta"
   fi
-  if [[ -z "$tag" ]]; then
+  if [[ -z "$tag" || ! "$digest" =~ ^[[:xdigit:]]{64}$ ]]; then
     tag="$MIHOMO_PINNED"
-    warn "GitHub API unavailable  -  using pinned release $tag"
+    digest="$pinned_digest"
+    warn "Trusted latest-release metadata unavailable  -  using pinned release $tag"
   fi
   local url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/mihomo-linux-${arch}-${tag}.gz"
   # Retry once - campus/container networks occasionally reset TLS mid-download.
@@ -359,6 +397,10 @@ install_mihomo_binary() {
     [[ "$attempt" == 1 ]] && warn "Download failed - retrying..."
   done
   [[ "$ok_dl" == true ]] || die "Failed to download mihomo binary ($tag)"
+  if ! printf '%s  %s\n' "$digest" "$tmpd/mihomo.gz" | sha256sum -c - >/dev/null 2>&1; then
+    die "mihomo checksum verification failed ($tag)"
+  fi
+  ok "mihomo SHA-256 verified ($tag)"
   # Stage + validate BEFORE touching the final path (no 0-byte ghosts).
   gunzip -c "$tmpd/mihomo.gz" > "$tmpd/mihomo.bin" 2>/dev/null \
     || die "Downloaded file is not a valid gzip archive"
@@ -400,6 +442,40 @@ valid_tun_stack() {
   esac
 }
 
+load_state() {
+  STATE_WIRED_IFACE=""
+  STATE_WIRED_CONN=""
+  STATE_PROFILE_CREATED=false
+  STATE_PREVIOUS_CONN=""
+  [[ -f "$STATE_FILE" ]] || return 0
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      WIRED_IFACE)      [[ "$value" =~ ^[[:alnum:]_.:-]+$ ]] && STATE_WIRED_IFACE="$value" ;;
+      WIRED_CONN)       [[ "$value" =~ ^[[:xdigit:]-]+$ ]] && STATE_WIRED_CONN="$value" ;;
+      PROFILE_CREATED)  [[ "$value" == true || "$value" == false ]] && STATE_PROFILE_CREATED="$value" ;;
+      PREVIOUS_CONN)    [[ -z "$value" || "$value" =~ ^[[:xdigit:]-]+$ ]] && STATE_PREVIOUS_CONN="$value" ;;
+    esac
+  done < "$STATE_FILE"
+}
+
+save_state() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  local tmp="${STATE_FILE}.tmp"
+  {
+    printf 'WIRED_IFACE=%s\n' "$WIRED_IFACE"
+    printf 'WIRED_CONN=%s\n' "$WIRED_CONN"
+    printf 'PROFILE_CREATED=%s\n' "$PROFILE_CREATED"
+    printf 'PREVIOUS_CONN=%s\n' "$PREVIOUS_CONN"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+nm_connection_exists() {
+  [[ -n "${1:-}" ]] && nmcli -g connection.uuid con show "$1" &>/dev/null
+}
+
 # Resolve an existing NetworkManager profile by UUID. Discovery must stay
 # read-only: profile creation belongs to apply_ip(), never diagnose/uninstall.
 find_wired_connection() {
@@ -429,14 +505,67 @@ find_wired_connection() {
 }
 
 ensure_wired_connection() {
-  [[ -n "$WIRED_CONN" ]] && return 0
-  local name="mnnit-wired-$WIRED_IFACE"
-  if nmcli con add type ethernet ifname "$WIRED_IFACE" con-name "$name" &>/dev/null; then
-    find_wired_connection || true
-    if [[ -n "$WIRED_CONN" ]]; then
-      ok "Created NM profile '$name'"
-      return 0
+  load_state
+  if [[ "$STATE_WIRED_IFACE" == "$WIRED_IFACE" ]] && nm_connection_exists "$STATE_WIRED_CONN"; then
+    WIRED_CONN="$STATE_WIRED_CONN"
+    PROFILE_CREATED="$STATE_PROFILE_CREATED"
+    PREVIOUS_CONN="$STATE_PREVIOUS_CONN"
+    return 0
+  fi
+  if [[ -n "$STATE_WIRED_IFACE" && "$STATE_WIRED_IFACE" != "$WIRED_IFACE" \
+        && "$STATE_PROFILE_CREATED" == true ]] && nm_connection_exists "$STATE_WIRED_CONN"; then
+    nmcli con down "$STATE_WIRED_CONN" 2>/dev/null || true
+    nmcli con delete "$STATE_WIRED_CONN" >/dev/null
+  fi
+
+  PROFILE_CREATED=false
+  PREVIOUS_CONN=""
+
+  local current_conn="$WIRED_CONN" current_name="" name="mnnit-campus-$WIRED_IFACE"
+  if [[ -n "$current_conn" ]]; then
+    current_name=$(nmcli -g connection.id con show "$current_conn" 2>/dev/null | head -1 || true)
+  fi
+
+  # Adopt profiles created by older mnnit-proxy releases. Never overwrite an
+  # arbitrary user profile: keep its UUID and create a dedicated campus one.
+  if [[ "$current_name" == mnnit-wired* || "$current_name" == mnnit-campus-* ]]; then
+    [[ "$current_name" == mnnit-campus-* ]] && PROFILE_CREATED=true
+    PREVIOUS_CONN=""
+    save_state
+    return 0
+  fi
+
+  PREVIOUS_CONN="$current_conn"
+  WIRED_CONN=""
+  local uuid type ifname profile_name
+  while IFS=: read -r uuid type; do
+    [[ "$type" == "802-3-ethernet" || "$type" == "ethernet" ]] || continue
+    ifname=$(nmcli -g connection.interface-name con show "$uuid" 2>/dev/null | head -1 || true)
+    profile_name=$(nmcli -g connection.id con show "$uuid" 2>/dev/null | head -1 || true)
+    if [[ "$ifname" == "$WIRED_IFACE" && "$profile_name" == "$name" ]]; then
+      WIRED_CONN="$uuid"
+      PROFILE_CREATED=true
+      break
     fi
+  done < <(nmcli -t -f UUID,TYPE con show 2>/dev/null || true)
+
+  if [[ -z "$WIRED_CONN" ]] && nmcli con add type ethernet ifname "$WIRED_IFACE" con-name "$name" &>/dev/null; then
+    while IFS=: read -r uuid type; do
+      [[ "$type" == "802-3-ethernet" || "$type" == "ethernet" ]] || continue
+      ifname=$(nmcli -g connection.interface-name con show "$uuid" 2>/dev/null | head -1 || true)
+      profile_name=$(nmcli -g connection.id con show "$uuid" 2>/dev/null | head -1 || true)
+      if [[ "$ifname" == "$WIRED_IFACE" && "$profile_name" == "$name" ]]; then
+        WIRED_CONN="$uuid"
+        break
+      fi
+    done < <(nmcli -t -f UUID,TYPE con show 2>/dev/null || true)
+    PROFILE_CREATED=true
+  fi
+
+  if [[ -n "$WIRED_CONN" ]]; then
+    save_state
+    ok "Using managed NM profile '$name'"
+    return 0
   fi
   warn "Could not create a NetworkManager profile for $WIRED_IFACE."
   return 1
@@ -462,6 +591,11 @@ detect_iface() {
       || { warn "Interface '$FLAG_INTERFACE' is not an Ethernet interface."; return 1; }
     iface="$FLAG_INTERFACE"
   else
+    load_state
+    if [[ -n "$STATE_WIRED_IFACE" && -d "/sys/class/net/$STATE_WIRED_IFACE" ]]; then
+      iface="$STATE_WIRED_IFACE"
+    fi
+
     for i in "${ifaces[@]}"; do
       if ip -4 -o addr show dev "$i" 2>/dev/null | awk '{print $4}' | grep -q '^172\.31\.'; then
         campus_ifaces+=("$i")
@@ -471,9 +605,9 @@ detect_iface() {
       fi
     done
 
-    if [[ ${#campus_ifaces[@]} -eq 1 ]]; then
+    if [[ -z "$iface" && ${#campus_ifaces[@]} -eq 1 ]]; then
       iface="${campus_ifaces[0]}"
-    elif [[ ${#carrier_ifaces[@]} -eq 1 ]]; then
+    elif [[ -z "$iface" && ${#carrier_ifaces[@]} -eq 1 ]]; then
       iface="${carrier_ifaces[0]}"
     fi
 
@@ -579,6 +713,7 @@ resolve_hostel_by_name() {
   SELECTED_HOSTEL_GW="${HOSTEL_GWS[idx]}"
   SELECTED_HOSTEL_PREFIX="${HOSTEL_PREFIXES[idx]}"
   SELECTED_HOSTEL_PROXIES="${HOSTEL_PROXIES[idx]}"
+  [[ "${HOSTEL_PREFIXES[idx]}" == "floorwise" ]] && SELECTED_HOSTEL_FLOORWISE=true || SELECTED_HOSTEL_FLOORWISE=false
   if ! in_range "$SELECTED_HOSTEL_IP" "${HOSTEL_FROMS[idx]}" "${HOSTEL_TOS[idx]}"; then
     if [[ "$FLAG_FORCE" != true ]]; then
       die "$SELECTED_HOSTEL_IP is outside ${SELECTED_HOSTEL_NAME}'s documented range (${HOSTEL_FROMS[idx]}–${HOSTEL_TOS[idx]}). Use --force to override."
@@ -636,7 +771,17 @@ summary_edit_loop() {
         while :; do
           local ip
           ip=$(ask "Enter your room IP" "$SELECTED_HOSTEL_IP")
-          if valid_ip "$ip"; then SELECTED_HOSTEL_IP="$ip"; break; fi
+          if valid_ip "$ip"; then
+            SELECTED_HOSTEL_IP="$ip"
+            if [[ "$SELECTED_HOSTEL_FLOORWISE" == true ]]; then
+              local IFS=. a b c d
+              read -r a b c d <<< "$ip"
+              SELECTED_HOSTEL_GW="${a}.${b}.${c}.1"
+              SELECTED_HOSTEL_PREFIX="24"
+              warn "Floor-wise gateway recalculated as $SELECTED_HOSTEL_GW  -  verify it in the summary."
+            fi
+            break
+          fi
           warn "Not a valid IP address"
         done
         ;;
@@ -705,6 +850,7 @@ pick_hostel() {
   SELECTED_HOSTEL_GW="${HOSTEL_GWS[idx]}"
   SELECTED_HOSTEL_PREFIX="${HOSTEL_PREFIXES[idx]}"
   SELECTED_HOSTEL_PROXIES="${HOSTEL_PROXIES[idx]}"
+  [[ "${HOSTEL_PREFIXES[idx]}" == "floorwise" ]] && SELECTED_HOSTEL_FLOORWISE=true || SELECTED_HOSTEL_FLOORWISE=false
   local ip_from="${HOSTEL_FROMS[idx]}" ip_to="${HOSTEL_TOS[idx]}" pdf="${HOSTEL_PDFS[idx]}"
 
   echo ""
@@ -816,6 +962,45 @@ config_group_readable() {
   return 1
 }
 
+install_rendered_config() {
+  local rendered="$1" stage test_dir
+  mkdir -p /etc/mihomo
+  stage=$(mktemp /etc/mihomo/.config.yaml.XXXXXX)
+  test_dir=$(mktemp -d)
+  printf '%s\n' "$rendered" > "$stage"
+  chmod 600 "$stage"
+  cp "$stage" "$test_dir/config.yaml"
+  chmod 600 "$test_dir/config.yaml"
+
+  if ! mihomo -t -d "$test_dir" >/dev/null 2>&1; then
+    mihomo -t -d "$test_dir" 2>&1 || true
+    rm -f "$stage"
+    rm -rf "$test_dir"
+    die "Config validation failed  -  existing config was not changed"
+  fi
+  rm -rf "$test_dir"
+
+  CONFIG_HAD_PREVIOUS=false
+  rm -f "$CONFIG_BACKUP"
+  if [[ -f /etc/mihomo/config.yaml ]]; then
+    cp -a /etc/mihomo/config.yaml "$CONFIG_BACKUP"
+    CONFIG_HAD_PREVIOUS=true
+  fi
+  mv "$stage" /etc/mihomo/config.yaml
+  chmod 600 /etc/mihomo/config.yaml
+  fix_config_ownership
+}
+
+restore_previous_config() {
+  if [[ "$CONFIG_HAD_PREVIOUS" == true && -f "$CONFIG_BACKUP" ]]; then
+    cp -a "$CONFIG_BACKUP" /etc/mihomo/config.yaml
+    fix_config_ownership
+    warn "Restored the previous mihomo config"
+  elif [[ "$CONFIG_HAD_PREVIOUS" != true ]]; then
+    rm -f /etc/mihomo/config.yaml
+  fi
+}
+
 # ---- config generation ----
 gen_config() {
   log "Generating mihomo config..."
@@ -843,7 +1028,6 @@ gen_config() {
     || die "Invalid TUN stack '$tun_stack' (use system|gvisor|mixed|mips)"
   local outbound_iface="$WIRED_IFACE"
 
-  mkdir -p /etc/mihomo
   local rendered
   rendered=$(python3 - "$proxy_entries" "$proxy_names" "$tun_enable" \
     "$tun_stack" "$outbound_iface" "$TEMPLATE" <<'PYEOF'
@@ -868,15 +1052,7 @@ if "{{" in t:
 sys.stdout.write(t)
 PYEOF
   ) || die "Failed to render config"
-  # Atomic write - an interrupted redirect would leave a truncated config
-  printf '%s\n' "$rendered" > /etc/mihomo/config.yaml.tmp
-  mv /etc/mihomo/config.yaml.tmp /etc/mihomo/config.yaml
-  chmod 600 /etc/mihomo/config.yaml
-  fix_config_ownership
-  mihomo -t -d /etc/mihomo >/dev/null 2>&1 || {
-    mihomo -t -d /etc/mihomo 2>&1 || true
-    die "Config validation failed  -  see errors above"
-  }
+  install_rendered_config "$rendered"
   ok "Config generated and validated (tun: $tun_enable)"
 }
 
@@ -903,6 +1079,8 @@ print_manual_ip_instructions() {
   │       routes:
   │         - to: default
   │           via: $SELECTED_HOSTEL_GW
+  │         - to: $CAMPUS_ROUTE
+  │           via: $SELECTED_HOSTEL_GW
   │       nameservers:
   │         addresses: [${DNS_SRV_LIST//,/ }]
   │ NETPLAN
@@ -928,6 +1106,8 @@ network:
       routes:
         - to: default
           via: $SELECTED_HOSTEL_GW
+        - to: $CAMPUS_ROUTE
+          via: $SELECTED_HOSTEL_GW
       nameservers:
         addresses: [${DNS_SRV_LIST//,/ }]
 EOF
@@ -938,7 +1118,16 @@ EOF
 netplan_iface_conflicts() {
   local base_dir
   base_dir="$(dirname "$NETPLAN_FILE")"
-  grep -rlE "(^|[^-[:alnum:]])$WIRED_IFACE:" "$base_dir"/*.yaml 2>/dev/null | head -1
+  local file
+  for file in "$base_dir"/*.yaml; do
+    [[ -f "$file" ]] || continue
+    [[ "$file" == "$NETPLAN_FILE" ]] && continue
+    if grep -Fq "$WIRED_IFACE:" "$file" 2>/dev/null; then
+      echo "$file"
+      return 0
+    fi
+  done
+  return 1
 }
 
 apply_netplan() {
@@ -949,7 +1138,12 @@ apply_netplan() {
     warn "Existing netplan file already configures $WIRED_IFACE: $(basename "$conflict")"
     warn "Not touching it  -  add these values there manually:"
     netplan_yaml | sed 's/^/    /'
-    return 0
+    return 1
+  fi
+  local backup=""
+  if [[ -f "$NETPLAN_FILE" ]]; then
+    backup="${NETPLAN_FILE}.previous"
+    cp -a "$NETPLAN_FILE" "$backup"
   fi
   netplan_yaml > "$NETPLAN_FILE.tmp"
   mv "$NETPLAN_FILE.tmp" "$NETPLAN_FILE"
@@ -961,12 +1155,14 @@ apply_netplan() {
       return 0
     fi
     warn "netplan apply ran but the IP is not on $WIRED_IFACE yet"
-    return 0
+    if [[ -n "$backup" ]]; then cp -a "$backup" "$NETPLAN_FILE"; else rm -f "$NETPLAN_FILE"; fi
+    return 1
   fi
   # Apply failed: roll back our file so the system is not left half-configured
-  rm -f "$NETPLAN_FILE"
+  if [[ -n "$backup" ]]; then cp -a "$backup" "$NETPLAN_FILE"; else rm -f "$NETPLAN_FILE"; fi
   warn "netplan apply failed  -  our config was rolled back. Instructions:"
   print_manual_ip_instructions
+  return 1
 }
 
 apply_ip() {
@@ -993,16 +1189,23 @@ apply_ip() {
   conn_name=$(nmcli -g connection.id con show "$WIRED_CONN" 2>/dev/null | head -1 || true)
   log "Setting static IP on '${conn_name:-$WIRED_CONN}'..."
   nmcli con mod "$WIRED_CONN" \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 100 \
     ipv4.method manual \
     ipv4.addresses "${SELECTED_HOSTEL_IP}/${SELECTED_HOSTEL_PREFIX}" \
     ipv4.gateway "$SELECTED_HOSTEL_GW" \
-    ipv4.dns "$DNS_SRV_LIST"
+    ipv4.dns "$DNS_SRV_LIST" \
+    ipv4.routes "${CAMPUS_ROUTE} ${SELECTED_HOSTEL_GW}"
   local carrier
   carrier=$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null || echo 0)
   if [[ "$carrier" == "1" ]]; then
     nmcli con down "$WIRED_CONN" 2>/dev/null >/dev/null || true
-    nmcli con up "$WIRED_CONN" || warn "Connection activation failed  -  check cable"
-    ok "Static IP applied"
+    if nmcli con up "$WIRED_CONN"; then
+      ok "Static IP applied"
+    else
+      fail "Connection activation failed  -  check the cable/IP settings"
+      return 1
+    fi
   else
     # No cable: never activate - a phantom "activated" profile confuses NM
     # (and the user). Config is saved; the dispatcher fires on plug-in.
@@ -1072,10 +1275,20 @@ should_start_mihomo() {
 reconcile_mihomo() {
   if campus_link; then
     if systemctl is-active --quiet mihomo 2>/dev/null; then
-      systemctl restart mihomo
+      if ! systemctl restart mihomo; then
+        fail "mihomo rejected the new config at runtime"
+        restore_previous_config
+        systemctl restart mihomo 2>/dev/null || true
+        return 1
+      fi
       ok "mihomo restarted with the new config"
     else
-      systemctl start mihomo
+      if ! systemctl start mihomo; then
+        fail "mihomo could not start with the new config"
+        restore_previous_config
+        systemctl start mihomo 2>/dev/null || true
+        return 1
+      fi
       ok "mihomo started on campus link"
     fi
   else
@@ -1140,6 +1353,17 @@ verify() {
       fail "Transparent route  -  NOT using Meta"
       echo "   route: ${tun_route:-unavailable}"
       verification_ok=false
+    fi
+
+    local ipv6_default
+    ipv6_default=$(ip -6 route show default 2>/dev/null | head -1 || true)
+    if [[ -n "$ipv6_default" && "$ipv6_default" != *" dev Meta "* ]]; then
+      fail "IPv6 default route bypasses Meta"
+      echo "   route: $ipv6_default"
+      echo "   Disable Wi-Fi/IPv6 while using the campus proxy."
+      verification_ok=false
+    else
+      ok "IPv6 bypass check  -  no external default route"
     fi
   fi
   # Test transparency: bypass any proxy env vars (boot_internet may have
@@ -1295,6 +1519,12 @@ diagnose() {
       warn "Gateway is not campus (172.31.*)  -  proxy can't work here"
     fi
   fi
+  local ipv6_default
+  ipv6_default=$(ip -6 route show default 2>/dev/null | head -1 || true)
+  if [[ -n "$ipv6_default" && "$ipv6_default" != *" dev Meta "* ]]; then
+    warn "IPv6 can bypass the proxy: $ipv6_default"
+    echo "   Disable Wi-Fi/IPv6 while using the campus proxy."
+  fi
   echo ""
   echo -e "${B}Proxy reachability:${N}"
   local proxies=()
@@ -1336,6 +1566,53 @@ diagnose() {
   ask "Press Enter to continue" ""
 }
 
+reset_nm_profile_to_dhcp() {
+  local conn="$1"
+  nmcli con mod "$conn" \
+    connection.autoconnect yes \
+    connection.autoconnect-priority 0 \
+    ipv4.method auto \
+    ipv4.addresses "" \
+    ipv4.gateway "" \
+    ipv4.dns "" \
+    ipv4.routes "" \
+    ipv4.never-default no
+}
+
+# Restore the connection that was active before mnnit-proxy created its
+# dedicated profile. Argument 1 is true during uninstall (delete our profile),
+# false for the updater's "restore DHCP" action.
+restore_nm_network() {
+  local uninstalling="${1:-false}"
+  load_state
+  local conn="${STATE_WIRED_CONN:-$WIRED_CONN}"
+  local created="$STATE_PROFILE_CREATED" previous="$STATE_PREVIOUS_CONN"
+
+  if nm_connection_exists "$conn"; then
+    nmcli con down "$conn" 2>/dev/null || true
+    if [[ "$created" == true && ( "$uninstalling" == true || -n "$previous" ) ]]; then
+      nmcli con delete "$conn" >/dev/null
+      ok "Removed the managed campus profile"
+    else
+      reset_nm_profile_to_dhcp "$conn"
+      ok "DHCP restored (campus DNS and routes cleared)"
+    fi
+  fi
+
+  if nm_connection_exists "$previous"; then
+    local previous_iface
+    previous_iface=$(nmcli -g connection.interface-name con show "$previous" 2>/dev/null | head -1 || true)
+    if [[ -n "$previous_iface" && "$(cat "/sys/class/net/$previous_iface/carrier" 2>/dev/null)" == "1" ]]; then
+      nmcli con up "$previous" 2>/dev/null || true
+    fi
+  elif [[ "$uninstalling" != true ]] && nm_connection_exists "$conn" \
+       && [[ "$(cat "/sys/class/net/$WIRED_IFACE/carrier" 2>/dev/null)" == "1" ]]; then
+    nmcli con up "$conn" 2>/dev/null || true
+  fi
+
+  rm -f "$STATE_FILE"
+}
+
 # ---- uninstall ----
 uninstall() {
   log "Uninstalling mnnit-proxy..."
@@ -1343,10 +1620,8 @@ uninstall() {
     :
   else
     detect_iface || true
-    if [[ -n "$WIRED_CONN" ]]; then
-      nmcli con mod "$WIRED_CONN" ipv4.method auto ipv4.addresses "" ipv4.gateway "" 2>/dev/null || true
-      nmcli con up "$WIRED_CONN" 2>/dev/null || true
-      ok "DHCP restored"
+    if [[ "$NET_BACKEND" == "networkmanager" ]]; then
+      restore_nm_network true
     fi
   fi
   systemctl stop mihomo 2>/dev/null || true
@@ -1354,6 +1629,7 @@ uninstall() {
   rm -f /etc/NetworkManager/dispatcher.d/90-mihomo-lan
   rm -rf /etc/mihomo
   rm -rf /opt/mnnit-proxy
+  rm -rf /var/lib/mnnit-proxy
   rm -f /usr/local/bin/mnnit-proxy-update
   if [[ "$FLAG_YES" == true ]] || confirm "Remove mihomo binary/package?" "n"; then
     # Package-manager-agnostic: pacman package (Arch) or binary install
@@ -1369,6 +1645,7 @@ uninstall() {
   # netplan file we may have written
   if [[ -f "$NETPLAN_FILE" ]]; then
     rm -f "$NETPLAN_FILE"
+    rm -f "${NETPLAN_FILE}.previous"
     netplan apply 2>/dev/null || true
     ok "netplan static IP removed"
   fi
@@ -1382,8 +1659,8 @@ main_install() {
   echo ""
   detect_distro
   preflight
-  ensure_data
   boot_internet
+  ensure_data
   install_mihomo
   if ! detect_iface; then
     if [[ "$FLAG_SKIP_IP" == true ]]; then
